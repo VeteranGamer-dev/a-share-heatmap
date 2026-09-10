@@ -148,6 +148,10 @@ export const messages = {
       headerTrendStatsLabel: "Sector title stats",
       headerTrendStatsOn: "On",
       headerTrendStatsOff: "Off",
+      heatmapBordersLabel: "Heatmap borders",
+      heatmapBordersOn: "Show",
+      heatmapBordersOff: "Hide",
+      heatmapBordersHint: "Hides solid outlines and retains spacing only between top-level sectors; the active stock uses a soft highlight.",
       settingsRefreshIntervalLabel: "Auto refresh",
       settingsRefreshIntervalUnit: "sec",
       settingsRefreshIntervalHint:
@@ -473,6 +477,10 @@ export const messages = {
       headerTrendStatsLabel: "板块标题栏统计",
       headerTrendStatsOn: "开",
       headerTrendStatsOff: "关",
+      heatmapBordersLabel: "热力图边框",
+      heatmapBordersOn: "显示",
+      heatmapBordersOff: "隐藏",
+      heatmapBordersHint: "隐藏实线边框，仅保留一级板块间隙；当前股票会以柔和提亮进行标识。",
       settingsRefreshIntervalLabel: "自动刷新",
       settingsRefreshIntervalUnit: "秒",
       settingsRefreshIntervalHint:

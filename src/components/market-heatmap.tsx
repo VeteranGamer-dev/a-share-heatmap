@@ -261,6 +261,7 @@ const changeRangeFilterStorageKey = "heatmap-change-range-filter";
 const filterOpenModeStorageKey = "heatmap-filter-open-mode";
 const thumbnailModeStorageKey = "heatmap-thumbnail-mode";
 const headerTrendStatsStorageKey = "heatmap-header-trend-stats";
+const heatmapBordersStorageKey = "heatmap-borders";
 const refreshIntervalStorageKey = "heatmap-refresh-interval";
 const defaultRefreshIntervalSeconds = 8;
 const minRefreshIntervalSeconds = 3;
@@ -1669,7 +1670,12 @@ function drawSectorThumbnailLabel(
   }
 }
 
-function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoomScale = 1) {
+function drawStockLabel(
+  context: CanvasRenderingContext2D,
+  stock: StockRect,
+  zoomScale = 1,
+  highlighted = false
+) {
   const displayWidth = stock.width * zoomScale;
   const displayHeight = stock.height * zoomScale;
   const screenUnit = 1 / zoomScale;
@@ -1689,6 +1695,8 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
   const hasLargeLabel = displayWidth >= 108 && displayHeight >= 58;
   const hasStackedLabel = displayWidth >= 28 && displayHeight >= 20;
   const hasInlineLabel = displayWidth >= 24 && displayHeight >= 10;
+  const titleWeight = highlighted ? 800 : 700;
+  const detailWeight = highlighted ? 750 : 650;
 
   context.save();
   try {
@@ -1703,7 +1711,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
       const titleSize = fitFontSizeToWidth(
         context,
         stock.name,
-        700,
+        titleWeight,
         preferredTitleSize,
         Math.max(12 * screenUnit, preferredTitleSize * 0.66),
         clipWidth
@@ -1717,7 +1725,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
 
       context.textAlign = "center";
       context.textBaseline = "middle";
-      context.font = heatmapFont(700, titleSize);
+      context.font = heatmapFont(titleWeight, titleSize);
       drawClippedText(
         context,
         fitTextToWidth(context, stock.name, clipWidth),
@@ -1729,7 +1737,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
         clipHeight
       );
 
-      context.font = heatmapFont(650, detailSize);
+      context.font = heatmapFont(detailWeight, detailSize);
       drawClippedText(
         context,
         formatChange(stock.changePct),
@@ -1763,7 +1771,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
       const titleSize = fitFontSizeToWidth(
         context,
         stock.name,
-        700,
+        titleWeight,
         preferredTitleSize,
         Math.max(6.5 * screenUnit, preferredTitleSize * 0.72),
         clipWidth - (textInsetX - clipPadding)
@@ -1775,7 +1783,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
 
       context.textAlign = "left";
       context.textBaseline = "alphabetic";
-      context.font = heatmapFont(700, titleSize);
+      context.font = heatmapFont(titleWeight, titleSize);
       drawClippedText(
         context,
         fitTextToWidth(context, stock.name, clipWidth - (textInsetX - clipPadding)),
@@ -1788,7 +1796,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
       );
 
       if (displayHeight >= 20) {
-        context.font = heatmapFont(650, detailSize);
+        context.font = heatmapFont(detailWeight, detailSize);
         drawClippedText(
           context,
           displayWidth >= 58 ? formatChange(stock.changePct) : formatCompactChange(stock.changePct),
@@ -1811,7 +1819,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
 
       context.textAlign = "left";
       context.textBaseline = "middle";
-      context.font = heatmapFont(650, fontSize);
+      context.font = heatmapFont(detailWeight, fontSize);
 
       const changeWidth = context.measureText(changeText).width;
       const canShowChange = displayWidth >= 32 && changeWidth + gap < clipWidth * 0.72;
@@ -1853,7 +1861,7 @@ function drawStockLabel(context: CanvasRenderingContext2D, stock: StockRect, zoo
 
       context.textAlign = "left";
       context.textBaseline = "middle";
-      context.font = heatmapFont(650, fontSize);
+      context.font = heatmapFont(detailWeight, fontSize);
       const fittedName = fitTextToWidth(context, stock.name, clipWidth);
 
       if (fittedName) {
@@ -3422,6 +3430,7 @@ function SettingsDrawer({
   displayMode,
   filterOpenMode,
   headerTrendStats,
+  heatmapBorders,
   refreshIntervalSeconds,
   themeColor,
   priceColorMode,
@@ -3436,6 +3445,7 @@ function SettingsDrawer({
   onDisplayModeChange,
   onFilterOpenModeChange,
   onHeaderTrendStatsChange,
+  onHeatmapBordersChange,
   onRefreshIntervalChange,
   onThemeColorChange,
   onPriceColorModeChange,
@@ -3456,6 +3466,7 @@ function SettingsDrawer({
   displayMode: DisplayMode;
   filterOpenMode: FilterOpenMode;
   headerTrendStats: boolean;
+  heatmapBorders: boolean;
   refreshIntervalSeconds: number;
   themeColor: ThemeColorKey;
   priceColorMode: PriceColorMode;
@@ -3471,6 +3482,7 @@ function SettingsDrawer({
   onDisplayModeChange: (mode: DisplayMode) => void;
   onFilterOpenModeChange: (mode: FilterOpenMode) => void;
   onHeaderTrendStatsChange: (enabled: boolean) => void;
+  onHeatmapBordersChange: (enabled: boolean) => void;
   onRefreshIntervalChange: (seconds: number) => void;
   onThemeColorChange: (theme: ThemeColorKey) => void;
   onPriceColorModeChange: (mode: PriceColorMode) => void;
@@ -3768,6 +3780,41 @@ function SettingsDrawer({
                       {messages.headerTrendStatsOn}
                     </button>
                   </div>
+                </section>
+
+                <section>
+                  <h3 className="text-sm font-semibold">{messages.heatmapBordersLabel}</h3>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onHeatmapBordersChange(false)}
+                      aria-pressed={!heatmapBorders}
+                      className={cn(
+                        "border px-3 py-2 text-left text-sm font-semibold transition-colors md:py-3",
+                        !heatmapBorders
+                          ? "border-brand/70 bg-brand/15 text-foreground"
+                          : "border-border bg-background/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      )}
+                    >
+                      {messages.heatmapBordersOff}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onHeatmapBordersChange(true)}
+                      aria-pressed={heatmapBorders}
+                      className={cn(
+                        "border px-3 py-2 text-left text-sm font-semibold transition-colors md:py-3",
+                        heatmapBorders
+                          ? "border-brand/70 bg-brand/15 text-foreground"
+                          : "border-border bg-background/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      )}
+                    >
+                      {messages.heatmapBordersOn}
+                    </button>
+                  </div>
+                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                    {messages.heatmapBordersHint}
+                  </p>
                 </section>
 
                 <section>
@@ -4245,6 +4292,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const [sizeMode, setSizeMode] = useState<HeatmapSizeMode>("marketCap");
   const [thumbnailMode, setThumbnailMode] = useState(false);
   const [headerTrendStats, setHeaderTrendStats] = useState(true);
+  const [heatmapBorders, setHeatmapBorders] = useState(true);
   const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(defaultRefreshIntervalSeconds);
   const [marketSummaries, setMarketSummaries] = useState<Partial<Record<MarketKey, MarketSummary>>>({});
   const [treemapData, setTreemapData] = useState<TreemapResponse | null>(null);
@@ -4383,6 +4431,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       const storedSizeMode = window.localStorage.getItem("heatmap-size-mode");
       const storedThumbnailMode = window.localStorage.getItem(thumbnailModeStorageKey);
       const storedHeaderTrendStats = window.localStorage.getItem(headerTrendStatsStorageKey);
+      const storedHeatmapBorders = window.localStorage.getItem(heatmapBordersStorageKey);
       const storedRefreshInterval = window.localStorage.getItem(refreshIntervalStorageKey);
       const storedMarket = window.sessionStorage.getItem(marketStorageKey);
       const storedPeriod = window.sessionStorage.getItem(periodStorageKey);
@@ -4417,6 +4466,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }
       if (storedHeaderTrendStats === "on" || storedHeaderTrendStats === "off") {
         setHeaderTrendStats(storedHeaderTrendStats === "on");
+      }
+      if (storedHeatmapBorders === "on" || storedHeatmapBorders === "off") {
+        setHeatmapBorders(storedHeatmapBorders === "on");
       }
       setRefreshIntervalSeconds(normalizeRefreshIntervalSeconds(storedRefreshInterval));
       const storedWatchlist = window.localStorage.getItem(watchlistStorageKey);
@@ -4558,6 +4610,17 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       /* Preferences are optional. */
     }
   }, [headerTrendStats, preferencesReady]);
+
+  useEffect(() => {
+    if (!preferencesReady) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(heatmapBordersStorageKey, heatmapBorders ? "on" : "off");
+    } catch {
+      /* Preferences are optional. */
+    }
+  }, [heatmapBorders, preferencesReady]);
 
   useEffect(() => {
     if (!preferencesReady) {
@@ -5355,7 +5418,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       0,
       canvasSize.width,
       canvasSize.height,
-      6
+      heatmapBorders ? 6 : 3
     );
 
     for (const boardBox of boardBoxes) {
@@ -5365,7 +5428,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         boardBox.width < 84 || boardBox.height < 54
           ? 0
           : clamp(Math.round(Math.min(Math.max(boardBox.height * 0.1, 16), 26)), 14, 26);
-      const contentPadding = boardBox.width > 110 && boardBox.height > 90 ? 3 : 2;
+      const contentPadding = heatmapBorders ? (boardBox.width > 110 && boardBox.height > 90 ? 3 : 2) : 0;
       const contentX = boardBox.x + contentPadding;
       const contentY = boardBox.y + titleHeight + contentPadding;
       const contentWidth = Math.max(0, boardBox.width - contentPadding * 2);
@@ -5413,7 +5476,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           contentY,
           contentWidth,
           contentHeight,
-          1.5
+          heatmapBorders ? 1.5 : 0
         );
 
         for (const stockBox of stockBoxes) {
@@ -5443,7 +5506,15 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         contentY,
         contentWidth,
         contentHeight,
-        boardBox.width > 96 && boardBox.height > 72 ? (thumbnailMode ? 3 : 2) : thumbnailMode ? 2 : 1
+        heatmapBorders
+          ? boardBox.width > 96 && boardBox.height > 72
+            ? thumbnailMode
+              ? 3
+              : 2
+            : thumbnailMode
+              ? 2
+              : 1
+          : 0
       );
 
       for (const subBoardBox of subBoardBoxes) {
@@ -5453,7 +5524,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           : subBoardBox.width < 52 || subBoardBox.height < 40
             ? 0
             : clamp(Math.round(Math.min(Math.max(subBoardBox.height * 0.14, 14), 22)), 12, 22);
-        const subPadding = thumbnailMode
+        const subPadding = !heatmapBorders || thumbnailMode
           ? 0
           : subBoardBox.width > 82 && subBoardBox.height > 56
             ? 2
@@ -5486,7 +5557,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           subContentY,
           subContentWidth,
           subContentHeight,
-          subBoardBox.width > 56 && subBoardBox.height > 38 ? 1 : 0.5
+          heatmapBorders
+            ? subBoardBox.width > 56 && subBoardBox.height > 38
+              ? 1
+              : 0.5
+            : 0
         );
 
         for (const stockBox of stockBoxes) {
@@ -5510,7 +5585,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     }
 
     return { stockRects, boardRects, subBoardRects };
-  }, [canvasSize.height, canvasSize.width, market, quotes, sizedTreemapData, thumbnailMode]);
+  }, [canvasSize.height, canvasSize.width, heatmapBorders, market, quotes, sizedTreemapData, thumbnailMode]);
 
   useEffect(() => {
     lastStockRectsRef.current = layout.stockRects;
@@ -5874,7 +5949,25 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       for (const stock of layout.stockRects) {
         context.fillStyle = getHeatColor(activeHeatTheme, stock.changePct, priceColorMode, displayMode);
         context.fillRect(stock.x, stock.y, stock.width, stock.height);
-        drawStockLabel(context, stock, view.scale);
+
+        const isHighlighted = !heatmapBorders && highlightedStock?.code === stock.code;
+        if (isHighlighted) {
+          context.fillStyle = displayMode === "light" ? "rgba(255, 255, 255, 0.16)" : "rgba(255, 255, 255, 0.13)";
+          context.fillRect(stock.x, stock.y, stock.width, stock.height);
+
+          const markerSize = Math.min(11 / view.scale, stock.width * 0.28, stock.height * 0.28);
+          if (markerSize >= 2 / view.scale) {
+            context.fillStyle = "rgba(255, 255, 255, 0.92)";
+            context.beginPath();
+            context.moveTo(stock.x + stock.width, stock.y);
+            context.lineTo(stock.x + stock.width - markerSize, stock.y);
+            context.lineTo(stock.x + stock.width, stock.y + markerSize);
+            context.closePath();
+            context.fill();
+          }
+        }
+
+        drawStockLabel(context, stock, view.scale, isHighlighted);
       }
     }
 
@@ -5892,18 +5985,23 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         context.fillRect(subBoard.x, subBoard.y, subBoard.width, subBoard.titleHeight);
       }
 
-      context.strokeStyle = isActiveSubBoard
-        ? heatmapCanvasTheme.activeSubBoardStroke
-        : heatmapCanvasTheme.subBoardBorder;
-      context.lineWidth = isActiveSubBoard ? 2 : thumbnailMode ? 1.1 : 0.9;
-      context.strokeRect(
-        subBoard.x + 0.5,
-        subBoard.y + 0.5,
-        Math.max(0, subBoard.width - 1),
-        Math.max(0, subBoard.height - 1)
-      );
+      if (heatmapBorders) {
+        context.strokeStyle = isActiveSubBoard
+          ? heatmapCanvasTheme.activeSubBoardStroke
+          : heatmapCanvasTheme.subBoardBorder;
+        context.lineWidth = isActiveSubBoard ? 2 : thumbnailMode ? 1.1 : 0.9;
+        context.strokeRect(
+          subBoard.x + 0.5,
+          subBoard.y + 0.5,
+          Math.max(0, subBoard.width - 1),
+          Math.max(0, subBoard.height - 1)
+        );
+      } else if (isActiveSubBoard && thumbnailMode) {
+        context.fillStyle = displayMode === "light" ? "rgba(255, 255, 255, 0.24)" : "rgba(255, 255, 255, 0.14)";
+        context.fillRect(subBoard.x, subBoard.y, subBoard.width, subBoard.height);
+      }
 
-      if (isActiveSubBoard) {
+      if (heatmapBorders && isActiveSubBoard) {
         context.strokeStyle = heatmapCanvasTheme.activeSubBoardInner;
         context.lineWidth = 0.8;
         context.strokeRect(
@@ -5944,12 +6042,14 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         }
       }
 
-      context.strokeStyle =
-        isActiveBoard || isTitleHovered
-          ? heatmapCanvasTheme.activeBoardStroke
-          : heatmapCanvasTheme.boardBorder;
-      context.lineWidth = isActiveBoard || isTitleHovered ? 1.8 : 1;
-      context.strokeRect(board.x + 0.5, board.y + 0.5, Math.max(0, board.width - 1), Math.max(0, board.height - 1));
+      if (heatmapBorders) {
+        context.strokeStyle =
+          isActiveBoard || isTitleHovered
+            ? heatmapCanvasTheme.activeBoardStroke
+            : heatmapCanvasTheme.boardBorder;
+        context.lineWidth = isActiveBoard || isTitleHovered ? 1.8 : 1;
+        context.strokeRect(board.x + 0.5, board.y + 0.5, Math.max(0, board.width - 1), Math.max(0, board.height - 1));
+      }
 
       if (board.width > 56 && board.titleHeight > 10) {
         const isBreadcrumb = boardFilter.includes(board.name);
@@ -5979,23 +6079,25 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     }
 
     if (highlightedStock) {
-      context.strokeStyle = heatmapCanvasTheme.highlightOuter;
-      context.lineWidth = 4;
-      context.strokeRect(
-        highlightedStock.x + 1,
-        highlightedStock.y + 1,
-        Math.max(0, highlightedStock.width - 2),
-        Math.max(0, highlightedStock.height - 2)
-      );
+      if (heatmapBorders) {
+        context.strokeStyle = heatmapCanvasTheme.highlightOuter;
+        context.lineWidth = 4;
+        context.strokeRect(
+          highlightedStock.x + 1,
+          highlightedStock.y + 1,
+          Math.max(0, highlightedStock.width - 2),
+          Math.max(0, highlightedStock.height - 2)
+        );
 
-      context.strokeStyle = heatmapCanvasTheme.highlightInner;
-      context.lineWidth = 2;
-      context.strokeRect(
-        highlightedStock.x + 1,
-        highlightedStock.y + 1,
-        Math.max(0, highlightedStock.width - 2),
-        Math.max(0, highlightedStock.height - 2)
-      );
+        context.strokeStyle = heatmapCanvasTheme.highlightInner;
+        context.lineWidth = 2;
+        context.strokeRect(
+          highlightedStock.x + 1,
+          highlightedStock.y + 1,
+          Math.max(0, highlightedStock.width - 2),
+          Math.max(0, highlightedStock.height - 2)
+        );
+      }
     }
 
     context.restore();
@@ -6021,6 +6123,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     messages,
     thumbnailMode,
     headerTrendStats,
+    heatmapBorders,
     activeHeatTheme,
     displayMode,
     priceColorMode,
@@ -8240,6 +8343,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         displayMode={displayMode}
         filterOpenMode={filterOpenMode}
         headerTrendStats={headerTrendStats}
+        heatmapBorders={heatmapBorders}
         themeColor={themeColor}
         priceColorMode={priceColorMode}
         heatThemeId={heatThemeId}
@@ -8254,6 +8358,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         onDisplayModeChange={setDisplayMode}
         onFilterOpenModeChange={setFilterOpenMode}
         onHeaderTrendStatsChange={setHeaderTrendStats}
+        onHeatmapBordersChange={setHeatmapBorders}
         refreshIntervalSeconds={refreshIntervalSeconds}
         onRefreshIntervalChange={setRefreshIntervalSeconds}
         onThemeColorChange={setThemeColor}
