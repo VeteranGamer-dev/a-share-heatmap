@@ -262,10 +262,26 @@ const filterOpenModeStorageKey = "heatmap-filter-open-mode";
 const thumbnailModeStorageKey = "heatmap-thumbnail-mode";
 const headerTrendStatsStorageKey = "heatmap-header-trend-stats";
 const heatmapBordersStorageKey = "heatmap-borders";
+const heatmapBordersQueryKey = "borders";
 const refreshIntervalStorageKey = "heatmap-refresh-interval";
 const defaultRefreshIntervalSeconds = 8;
 const minRefreshIntervalSeconds = 3;
 const maxRefreshIntervalSeconds = 600;
+
+function parseHeatmapBordersQuery(value: string | null) {
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["on", "show", "true", "1"].includes(normalized)) {
+    return true;
+  }
+  if (["off", "hide", "false", "0"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
 
 function normalizeRefreshIntervalSeconds(raw: string | null): number {
   const parsed = Number.parseInt(raw ?? "", 10);
@@ -4292,7 +4308,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const [sizeMode, setSizeMode] = useState<HeatmapSizeMode>("marketCap");
   const [thumbnailMode, setThumbnailMode] = useState(false);
   const [headerTrendStats, setHeaderTrendStats] = useState(true);
-  const [heatmapBorders, setHeatmapBorders] = useState(true);
+  const [heatmapBordersPreference, setHeatmapBordersPreference] = useState(true);
+  const [heatmapBordersUrlOverride, setHeatmapBordersUrlOverride] = useState<boolean | null>(null);
+  const heatmapBorders = heatmapBordersUrlOverride ?? heatmapBordersPreference;
   const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(defaultRefreshIntervalSeconds);
   const [marketSummaries, setMarketSummaries] = useState<Partial<Record<MarketKey, MarketSummary>>>({});
   const [treemapData, setTreemapData] = useState<TreemapResponse | null>(null);
@@ -4421,6 +4439,28 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     lastTapY: 0,
   });
 
+  const handleHeatmapBordersChange = useCallback((enabled: boolean) => {
+    setHeatmapBordersPreference(enabled);
+    setHeatmapBordersUrlOverride(null);
+
+    const url = new URL(window.location.href);
+    if (url.searchParams.has(heatmapBordersQueryKey)) {
+      url.searchParams.delete(heatmapBordersQueryKey);
+      window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    const syncFromUrl = () => {
+      const params = new URLSearchParams(window.location.search);
+      setHeatmapBordersUrlOverride(parseHeatmapBordersQuery(params.get(heatmapBordersQueryKey)));
+    };
+
+    syncFromUrl();
+    window.addEventListener("popstate", syncFromUrl);
+    return () => window.removeEventListener("popstate", syncFromUrl);
+  }, []);
+
   useEffect(() => {
     try {
       const storedLocale = window.localStorage.getItem("heatmap-locale");
@@ -4468,7 +4508,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         setHeaderTrendStats(storedHeaderTrendStats === "on");
       }
       if (storedHeatmapBorders === "on" || storedHeatmapBorders === "off") {
-        setHeatmapBorders(storedHeatmapBorders === "on");
+        setHeatmapBordersPreference(storedHeatmapBorders === "on");
       }
       setRefreshIntervalSeconds(normalizeRefreshIntervalSeconds(storedRefreshInterval));
       const storedWatchlist = window.localStorage.getItem(watchlistStorageKey);
@@ -4616,11 +4656,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       return;
     }
     try {
-      window.localStorage.setItem(heatmapBordersStorageKey, heatmapBorders ? "on" : "off");
+      window.localStorage.setItem(heatmapBordersStorageKey, heatmapBordersPreference ? "on" : "off");
     } catch {
       /* Preferences are optional. */
     }
-  }, [heatmapBorders, preferencesReady]);
+  }, [heatmapBordersPreference, preferencesReady]);
 
   useEffect(() => {
     if (!preferencesReady) {
@@ -8358,7 +8398,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         onDisplayModeChange={setDisplayMode}
         onFilterOpenModeChange={setFilterOpenMode}
         onHeaderTrendStatsChange={setHeaderTrendStats}
-        onHeatmapBordersChange={setHeatmapBorders}
+        onHeatmapBordersChange={handleHeatmapBordersChange}
         refreshIntervalSeconds={refreshIntervalSeconds}
         onRefreshIntervalChange={setRefreshIntervalSeconds}
         onThemeColorChange={setThemeColor}

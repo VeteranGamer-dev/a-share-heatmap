@@ -51,6 +51,15 @@ pnpm dev
 
 打开 [http://localhost:3000](http://localhost:3000) 查看页面。
 
+### URL 显示参数
+
+可以通过 `borders` 参数直接指定热力图是否显示边框：
+
+- `?borders=off`：隐藏实线边框，仅保留一级板块间隙。
+- `?borders=on`：显示完整边框。
+
+URL 参数优先于浏览器中保存的显示偏好，移除参数后会恢复本地设置。同时支持 `true` / `false` 和 `1` / `0`。
+
 ### WebMCP 实验支持
 
 项目提供一组可被浏览器 AI 发现的 WebMCP 工具：
