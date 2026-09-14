@@ -130,6 +130,13 @@ type QuoteLoadProgress = {
   totalCount: number;
 };
 
+type PendingQuoteCommit = {
+  quotes: QuoteMap;
+  loadedCount: number;
+  totalCount: number;
+  updatedAt: string;
+};
+
 const inspectorSortKeys = ["changeDesc", "changeAsc", "changeAbs", "turnover", "name"] as const;
 type InspectorSortKey = (typeof inspectorSortKeys)[number];
 
@@ -161,6 +168,10 @@ type BoardTrendStats = {
   advanceCount: number;
   flatCount: number;
   declineCount: number;
+};
+
+type SectorVisualStats = BoardTrendStats & {
+  changePct: number;
 };
 
 type BoardRect = {
@@ -281,6 +292,8 @@ const refreshIntervalStorageKey = "heatmap-refresh-interval";
 const defaultRefreshIntervalSeconds = 8;
 const minRefreshIntervalSeconds = 3;
 const maxRefreshIntervalSeconds = 600;
+const progressiveQuoteCommitIntervalMs = 500;
+const emptyQuoteMap: QuoteMap = {};
 
 function parseHeatmapBordersQuery(value: string | null) {
   if (value === null) {
@@ -1196,6 +1209,49 @@ function weightedAverageChange(
   return weightedSum / totalValue;
 }
 
+function sectorStatsKey(boardName: string, subBoardName: string) {
+  return `${boardName}\u0000${subBoardName}`;
+}
+
+function buildSectorVisualStats(
+  data: TreemapResponse | null,
+  quotes: QuoteMap
+): {
+  boards: Map<string, SectorVisualStats>;
+  subBoards: Map<string, SectorVisualStats>;
+} {
+  const boards = new Map<string, SectorVisualStats>();
+  const subBoards = new Map<string, SectorVisualStats>();
+
+  if (!data) {
+    return { boards, subBoards };
+  }
+
+  for (const board of data.nodes) {
+    boards.set(board.name, {
+      changePct: weightedAverageChange(board.children, quotes),
+      ...countStockTrends(board.children, quotes),
+    });
+
+    const stocksBySubBoard = new Map<string, typeof board.children>();
+    for (const stock of board.children) {
+      const subBoardName = stock.subBoardName || stock.boardName;
+      const stocks = stocksBySubBoard.get(subBoardName) ?? [];
+      stocks.push(stock);
+      stocksBySubBoard.set(subBoardName, stocks);
+    }
+
+    for (const [subBoardName, stocks] of stocksBySubBoard) {
+      subBoards.set(sectorStatsKey(board.name, subBoardName), {
+        changePct: weightedAverageChange(stocks, quotes),
+        ...countStockTrends(stocks, quotes),
+      });
+    }
+  }
+
+  return { boards, subBoards };
+}
+
 function groupStocksBySubBoard<
   T extends {
     code: string;
@@ -1204,7 +1260,7 @@ function groupStocksBySubBoard<
     value: number;
     changePct: number;
   },
->(stocks: T[], quotes: QuoteMap) {
+>(stocks: T[]) {
   const subBoardMap = new Map<string, T[]>();
 
   for (const stock of stocks) {
@@ -1220,7 +1276,7 @@ function groupStocksBySubBoard<
       boardName: children[0]?.boardName ?? "",
       stockCount: children.length,
       value: children.reduce((sum, child) => sum + child.value, 0),
-      changePct: weightedAverageChange(children, quotes),
+      changePct: weightedAverageChange(children, emptyQuoteMap),
       children: [...children].sort((left, right) => right.value - left.value),
     }))
     .sort((left, right) => right.value - left.value);
@@ -1767,8 +1823,11 @@ function drawStockLabel(
   context: CanvasRenderingContext2D,
   stock: StockRect,
   zoomScale = 1,
-  highlighted = false
+  highlighted = false,
+  quote?: QuoteMap[string]
 ) {
+  const price = quote?.price ?? stock.price;
+  const changePct = quote?.changePct ?? stock.changePct;
   const displayWidth = stock.width * zoomScale;
   const displayHeight = stock.height * zoomScale;
   const screenUnit = 1 / zoomScale;
@@ -1824,7 +1883,7 @@ function drawStockLabel(
           fallbackFontSize: titleSize,
         },
         {
-          text: formatChange(stock.changePct),
+          text: formatChange(changePct),
           font: heatmapFont(detailWeight, detailSize),
           fallbackFontSize: detailSize,
         },
@@ -1833,7 +1892,7 @@ function drawStockLabel(
       if (displayWidth > 180 && displayHeight > 100) {
         const priceSize = Math.max(11 * screenUnit, detailSize - 1 * screenUnit);
         lines.push({
-          text: formatPrice(stock.price),
+          text: formatPrice(price),
           font: heatmapFont(550, priceSize),
           fallbackFontSize: priceSize,
         });
@@ -1889,7 +1948,7 @@ function drawStockLabel(
         context.font = heatmapFont(detailWeight, detailSize);
         drawClippedText(
           context,
-          displayWidth >= 58 ? formatChange(stock.changePct) : formatCompactChange(stock.changePct),
+          displayWidth >= 58 ? formatChange(changePct) : formatCompactChange(changePct),
           stock.x + textInsetX,
           stock.y + textInsetY + titleSize + detailSize + 1.5 * screenUnit,
           stock.x + clipPadding,
@@ -1904,7 +1963,7 @@ function drawStockLabel(
     if (hasInlineLabel) {
       const fontSize =
         clamp(Math.floor(Math.min(displayWidth * 0.18, displayHeight * 0.68)), 6.5, 11) * screenUnit;
-      const changeText = formatCompactChange(stock.changePct);
+      const changeText = formatCompactChange(changePct);
       const gap = 3 * screenUnit;
 
       context.textAlign = "left";
@@ -4500,6 +4559,10 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const lastBoardRectsRef = useRef<BoardRect[]>([]);
   const lastSubBoardRectsRef = useRef<SubBoardRect[]>([]);
   const quoteStreamRef = useRef<{ key: string; controller: AbortController } | null>(null);
+  const pendingQuoteCommitRef = useRef<PendingQuoteCommit | null>(null);
+  const quoteCommitTimerRef = useRef<number | null>(null);
+  const quoteCommitFrameRef = useRef<number | null>(null);
+  const lastQuoteCommitAtRef = useRef(0);
   const sidebarFilterTriggerRef = useRef<HTMLButtonElement>(null);
   const filterTriggerRefs = useMemo(() => [sidebarFilterTriggerRef], []);
   const filterHoverOpenTimerRef = useRef<number | null>(null);
@@ -4902,6 +4965,66 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const watchlistCodeSet = useMemo(() => new Set(watchlistCodes), [watchlistCodes]);
   const isWatchlist = market === watchlistUniverseKey;
 
+  const clearScheduledQuoteCommit = useCallback(() => {
+    if (quoteCommitTimerRef.current !== null) {
+      window.clearTimeout(quoteCommitTimerRef.current);
+      quoteCommitTimerRef.current = null;
+    }
+    if (quoteCommitFrameRef.current !== null) {
+      window.cancelAnimationFrame(quoteCommitFrameRef.current);
+      quoteCommitFrameRef.current = null;
+    }
+  }, []);
+
+  const flushPendingQuoteCommit = useCallback(() => {
+    const pending = pendingQuoteCommitRef.current;
+    if (!pending) {
+      return;
+    }
+
+    pendingQuoteCommitRef.current = null;
+    lastQuoteCommitAtRef.current = window.performance.now();
+    setQuotes((current) => ({ ...current, ...pending.quotes }));
+    setQuoteLoadProgress({
+      active: true,
+      loadedCount: pending.loadedCount,
+      totalCount: pending.totalCount,
+    });
+    if (pending.updatedAt) {
+      setUpdatedAt(pending.updatedAt);
+    }
+    setDataSource((current) => (current === "direct" ? current : "stale"));
+  }, []);
+
+  const scheduleQuoteCommit = useCallback(
+    (immediate = false) => {
+      if (quoteCommitTimerRef.current !== null || quoteCommitFrameRef.current !== null) {
+        return;
+      }
+
+      const queueFrame = () => {
+        quoteCommitTimerRef.current = null;
+        if (quoteCommitFrameRef.current !== null) {
+          return;
+        }
+        quoteCommitFrameRef.current = window.requestAnimationFrame(() => {
+          quoteCommitFrameRef.current = null;
+          flushPendingQuoteCommit();
+        });
+      };
+
+      const elapsed = window.performance.now() - lastQuoteCommitAtRef.current;
+      const delay = immediate ? 0 : Math.max(0, progressiveQuoteCommitIntervalMs - elapsed);
+      if (delay === 0) {
+        queueFrame();
+        return;
+      }
+
+      quoteCommitTimerRef.current = window.setTimeout(queueFrame, delay);
+    },
+    [flushPendingQuoteCommit]
+  );
+
   const fetchTreemap = useCallback(
     async (nextMarket: HeatmapUniverse, nextPeriod: HeatmapPeriodKey, codes: string[]) => {
       if (nextMarket === watchlistUniverseKey) {
@@ -4976,6 +5099,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }
 
       quoteStreamRef.current?.controller.abort();
+      clearScheduledQuoteCommit();
+      pendingQuoteCommitRef.current = null;
+      lastQuoteCommitAtRef.current = 0;
       const controller = new AbortController();
       quoteStreamRef.current = { key: requestKey, controller };
       setQuoteLoadProgress({ active: true, loadedCount: 0, totalCount: 0 });
@@ -4988,6 +5114,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }
 
       const receivedQuotes: QuoteMap = {};
+      let hasReceivedQuotes = false;
       let completed = false;
 
       try {
@@ -5006,22 +5133,28 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           }
 
           if (event.type === "quotes") {
+            const isFirstBatch = !hasReceivedQuotes;
+            hasReceivedQuotes = true;
             Object.assign(receivedQuotes, event.quotes);
-            setQuotes((current) => ({ ...current, ...event.quotes }));
-            setQuoteLoadProgress({
-              active: true,
+            const pending = pendingQuoteCommitRef.current ?? {
+              quotes: {},
               loadedCount: event.loadedCount,
               totalCount: event.totalCount,
-            });
-            if (event.updatedAt) {
-              setUpdatedAt(event.updatedAt);
-            }
-            setDataSource((current) => (current === "direct" ? current : "stale"));
+              updatedAt: "",
+            };
+            Object.assign(pending.quotes, event.quotes);
+            pending.loadedCount = event.loadedCount;
+            pending.totalCount = event.totalCount;
+            pending.updatedAt = event.updatedAt || pending.updatedAt;
+            pendingQuoteCommitRef.current = pending;
+            scheduleQuoteCommit(isFirstBatch);
             return;
           }
 
           if (event.type === "complete") {
             completed = true;
+            clearScheduledQuoteCommit();
+            flushPendingQuoteCommit();
             setSettledQuotes((current) => ({ ...current, ...receivedQuotes }));
             setQuoteLoadProgress({
               active: false,
@@ -5046,6 +5179,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         if (controller.signal.aborted) {
           return;
         }
+        clearScheduledQuoteCommit();
+        flushPendingQuoteCommit();
         setQuoteLoadProgress((current) =>
           current ? { ...current, active: false } : current
         );
@@ -5056,7 +5191,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         }
       }
     },
-    [messages.errorLoad]
+    [clearScheduledQuoteCommit, flushPendingQuoteCommit, messages.errorLoad, scheduleQuoteCommit]
   );
 
   const fetchMarketSummaries = useCallback(async (nextPeriod: HeatmapPeriodKey) => {
@@ -5181,6 +5316,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   useEffect(() => {
     quoteStreamRef.current?.controller.abort();
     quoteStreamRef.current = null;
+    clearScheduledQuoteCommit();
+    pendingQuoteCommitRef.current = null;
+    lastQuoteCommitAtRef.current = 0;
     setQuotes({});
     setSettledQuotes({});
     setQuoteLoadProgress(null);
@@ -5188,8 +5326,10 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     return () => {
       quoteStreamRef.current?.controller.abort();
       quoteStreamRef.current = null;
+      clearScheduledQuoteCommit();
+      pendingQuoteCommitRef.current = null;
     };
-  }, [quoteQueryKey]);
+  }, [clearScheduledQuoteCommit, quoteQueryKey]);
 
   useEffect(() => {
     if (!preferencesReady) {
@@ -5644,6 +5784,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     [settledQuotes, sizeMode, visibleTreemapData]
   );
 
+  const sectorVisualStats = useMemo(
+    () => buildSectorVisualStats(sizedTreemapData, quotes),
+    [quotes, sizedTreemapData]
+  );
+
   const layout = useMemo(() => {
     if (!sizedTreemapData) {
       return {
@@ -5667,8 +5812,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     );
 
     for (const boardBox of boardBoxes) {
-      const boardChangePct = weightedAverageChange(boardBox.item.children, quotes);
-      const boardTrends = countStockTrends(boardBox.item.children, quotes);
+      const boardChangePct = weightedAverageChange(boardBox.item.children, emptyQuoteMap);
+      const boardTrends = countStockTrends(boardBox.item.children, emptyQuoteMap);
       const titleHeight =
         boardBox.width < 84 || boardBox.height < 54
           ? 0
@@ -5695,7 +5840,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         continue;
       }
 
-      const subBoards = groupStocksBySubBoard(boardBox.item.children, quotes);
+      const subBoards = groupStocksBySubBoard(boardBox.item.children);
       const shouldNestSubBoards = market !== "zza50" && (thumbnailMode || subBoards.length > 1);
 
       if (!shouldNestSubBoards) {
@@ -5725,8 +5870,6 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         );
 
         for (const stockBox of stockBoxes) {
-          const quote = quotes[stockBox.item.code];
-
           stockRects.push({
             code: stockBox.item.code,
             name: stockBox.item.name,
@@ -5737,8 +5880,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
             y: stockBox.y,
             width: stockBox.width,
             height: stockBox.height,
-            price: quote?.price ?? stockBox.item.price,
-            changePct: quote?.changePct ?? stockBox.item.changePct,
+            price: stockBox.item.price,
+            changePct: stockBox.item.changePct,
           });
         }
 
@@ -5763,7 +5906,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       );
 
       for (const subBoardBox of subBoardBoxes) {
-        const subTrends = countStockTrends(subBoardBox.item.children, quotes);
+        const subTrends = countStockTrends(subBoardBox.item.children, emptyQuoteMap);
         const subTitleHeight = thumbnailMode
           ? 0
           : subBoardBox.width < 52 || subBoardBox.height < 40
@@ -5810,8 +5953,6 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         );
 
         for (const stockBox of stockBoxes) {
-          const quote = quotes[stockBox.item.code];
-
           stockRects.push({
             code: stockBox.item.code,
             name: stockBox.item.name,
@@ -5822,15 +5963,15 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
             y: stockBox.y,
             width: stockBox.width,
             height: stockBox.height,
-            price: quote?.price ?? stockBox.item.price,
-            changePct: quote?.changePct ?? stockBox.item.changePct,
+            price: stockBox.item.price,
+            changePct: stockBox.item.changePct,
           });
         }
       }
     }
 
     return { stockRects, boardRects, subBoardRects };
-  }, [canvasSize.height, canvasSize.width, heatmapBorders, market, quotes, sizedTreemapData, thumbnailMode]);
+  }, [canvasSize.height, canvasSize.width, heatmapBorders, market, sizedTreemapData, thumbnailMode]);
 
   useEffect(() => {
     lastStockRectsRef.current = layout.stockRects;
@@ -5922,13 +6063,14 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }));
     }
 
+    const highlightedQuote = quotes[highlightedStock.code];
     const current = activeBoardStocks.find((stock) => stock.code === highlightedStock.code) ?? {
       code: highlightedStock.code,
       name: highlightedStock.name,
       subBoardName: highlightedStock.subBoardName,
-      price: highlightedStock.price,
-      changePct: highlightedStock.changePct,
-      turnoverAmount: quotes[highlightedStock.code]?.turnoverAmount ?? 0,
+      price: highlightedQuote?.price ?? highlightedStock.price,
+      changePct: highlightedQuote?.changePct ?? highlightedStock.changePct,
+      turnoverAmount: highlightedQuote?.turnoverAmount ?? 0,
       marketCap: highlightedStock.value,
     };
 
@@ -6155,10 +6297,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       return;
     }
 
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
+    const frame = window.requestAnimationFrame(() => {
+      const context = canvas.getContext("2d");
+      if (!context) {
+        return;
+      }
 
     const pixelRatio = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
     canvas.width = Math.floor(canvasSize.width * pixelRatio);
@@ -6184,15 +6327,19 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     }
 
     for (const subBoard of layout.subBoardRects) {
+      const stats =
+        sectorVisualStats.subBoards.get(sectorStatsKey(subBoard.boardName, subBoard.name)) ?? subBoard;
       context.fillStyle = thumbnailMode
-        ? getHeatColor(activeHeatTheme, subBoard.changePct, priceColorMode, displayMode)
+        ? getHeatColor(activeHeatTheme, stats.changePct, priceColorMode, displayMode)
         : heatmapCanvasTheme.subBoardFill;
       context.fillRect(subBoard.x, subBoard.y, subBoard.width, subBoard.height);
     }
 
     if (!thumbnailMode) {
       for (const stock of layout.stockRects) {
-        context.fillStyle = getHeatColor(activeHeatTheme, stock.changePct, priceColorMode, displayMode);
+        const quote = quotes[stock.code];
+        const changePct = quote?.changePct ?? stock.changePct;
+        context.fillStyle = getHeatColor(activeHeatTheme, changePct, priceColorMode, displayMode);
         context.fillRect(stock.x, stock.y, stock.width, stock.height);
 
         const isHighlighted = !heatmapBorders && highlightedStock?.code === stock.code;
@@ -6212,18 +6359,20 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           }
         }
 
-        drawStockLabel(context, stock, view.scale, isHighlighted);
+        drawStockLabel(context, stock, view.scale, isHighlighted, quote);
       }
     }
 
     for (const subBoard of layout.subBoardRects) {
+      const stats =
+        sectorVisualStats.subBoards.get(sectorStatsKey(subBoard.boardName, subBoard.name)) ?? subBoard;
       const isActiveSubBoard =
         activeSubBoardName === subBoard.name && activeBoardName === subBoard.boardName;
 
       if (!thumbnailMode && subBoard.titleHeight > 0) {
         context.fillStyle = getBoardHeaderColor(
           activeHeatTheme,
-          subBoard.changePct,
+          stats.changePct,
           priceColorMode,
           displayMode
         );
@@ -6258,13 +6407,13 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }
 
       if (thumbnailMode) {
-        drawSectorThumbnailLabel(context, subBoard, messages, view.scale);
+        drawSectorThumbnailLabel(context, { ...subBoard, ...stats }, messages, view.scale);
       } else if (subBoard.width > 44 && subBoard.titleHeight > 8) {
         drawSectorHeaderLabel(context, subBoard, {
           name: subBoard.name,
-          changePct: subBoard.changePct,
-          advanceCount: subBoard.advanceCount,
-          declineCount: subBoard.declineCount,
+          changePct: stats.changePct,
+          advanceCount: stats.advanceCount,
+          declineCount: stats.declineCount,
           messages,
           compact: true,
           showStats: headerTrendStats,
@@ -6273,12 +6422,13 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     }
 
     for (const board of layout.boardRects) {
+      const stats = sectorVisualStats.boards.get(board.name) ?? board;
       const isActiveBoard = activeBoardName === board.name;
       const isTitleHovered = hoveredBoardTitleName === board.name;
       const showDrillHint = isAllBoardsSelected && board.width > 72 && board.titleHeight > 10;
 
       if (board.titleHeight > 0) {
-        context.fillStyle = getBoardHeaderColor(activeHeatTheme, board.changePct, priceColorMode, displayMode);
+        context.fillStyle = getBoardHeaderColor(activeHeatTheme, stats.changePct, priceColorMode, displayMode);
         context.fillRect(board.x, board.y, board.width, board.titleHeight);
 
         if (isActiveBoard || isTitleHovered) {
@@ -6305,9 +6455,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           : board.name;
         drawSectorHeaderLabel(context, board, {
           name: titleText,
-          changePct: board.changePct,
-          advanceCount: board.advanceCount,
-          declineCount: board.declineCount,
+          changePct: stats.changePct,
+          advanceCount: stats.advanceCount,
+          declineCount: stats.declineCount,
           messages,
           showDrillHint,
           showStats: thumbnailMode || headerTrendStats,
@@ -6349,9 +6499,10 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
     // First successful paint of any data makes the sample Canvas authoritative —
     // hide the full-screen loading overlay from then on so it never masks the bars.
-    if (!samplePainted) {
       setSamplePainted(true);
-    }
+    });
+
+    return () => window.cancelAnimationFrame(frame);
   }, [
     canvasSize.height,
     canvasSize.width,
@@ -6372,7 +6523,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     activeHeatTheme,
     displayMode,
     priceColorMode,
-    samplePainted,
+    quotes,
+    sectorVisualStats,
     view.scale,
     view.x,
     view.y,
