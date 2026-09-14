@@ -1,0 +1,58 @@
+name: 刷新 A 股股票池
+
+on:
+  schedule:
+    # 工作日北京时间 18:30，收盘后刷新股票名册和兜底行情。
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-market-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出默认分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 刷新并验证股票数据
+        run: pnpm refresh:data
+
+      - name: 检查类型和生产构建
+        run: |
+          pnpm build
+          pnpm typecheck
+
+      - name: 提交更新
+        run: |
+          git add src/lib/data/market-heatmap-fallback.json src/lib/data/market-heatmap-subboards.json
+          if git diff --cached --quiet; then
+            echo "股票数据没有变化"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "自动刷新 A 股股票池"
+          git push origin HEAD:${{ github.event.repository.default_branch }}

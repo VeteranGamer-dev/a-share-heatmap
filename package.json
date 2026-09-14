@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "refresh:data": "node scripts/refresh-market-data.mjs",
+    "check:data": "node scripts/refresh-market-data.mjs --check"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.31",

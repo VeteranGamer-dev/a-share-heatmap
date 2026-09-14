@@ -103,6 +103,7 @@ import {
   type MarketDataSource,
   type MarketKey,
   type MarketOverviewResponse,
+  type ProgressiveQuoteEvent,
   type TreemapResponse,
 } from "@/lib/market-heatmap";
 import {
@@ -115,6 +116,19 @@ import {
 import { useHeatmapWebMcp } from "@/hooks/use-heatmap-webmcp";
 
 type QuoteMap = Record<string, { price: number; changePct: number; turnoverAmount: number }>;
+
+type QuoteStreamEvent =
+  | ProgressiveQuoteEvent
+  | {
+      type: "error";
+      message: string;
+    };
+
+type QuoteLoadProgress = {
+  active: boolean;
+  loadedCount: number;
+  totalCount: number;
+};
 
 const inspectorSortKeys = ["changeDesc", "changeAsc", "changeAbs", "turnover", "name"] as const;
 type InspectorSortKey = (typeof inspectorSortKeys)[number];
@@ -1420,6 +1434,69 @@ function fitFontSizeToWidth(
   return clamp((preferredSize * maxWidth) / preferredWidth, minSize, preferredSize);
 }
 
+type CanvasTextLine = {
+  text: string;
+  font: string;
+};
+
+function measureCanvasTextLine(
+  context: CanvasRenderingContext2D,
+  line: CanvasTextLine,
+  fallbackFontSize: number
+) {
+  context.font = line.font;
+  const metrics = context.measureText(line.text);
+  const measuredAscent = metrics.actualBoundingBoxAscent;
+  const measuredDescent = metrics.actualBoundingBoxDescent;
+
+  return {
+    ascent:
+      Number.isFinite(measuredAscent) && measuredAscent > 0
+        ? measuredAscent
+        : fallbackFontSize * 0.8,
+    descent:
+      Number.isFinite(measuredDescent) && measuredDescent >= 0
+        ? measuredDescent
+        : fallbackFontSize * 0.2,
+  };
+}
+
+function drawCenteredTextStack(
+  context: CanvasRenderingContext2D,
+  lines: Array<CanvasTextLine & { fallbackFontSize: number }>,
+  centerX: number,
+  centerY: number,
+  lineGap: number,
+  clipRect: { x: number; y: number; width: number; height: number }
+) {
+  const measuredLines = lines.map((line) => ({
+    ...line,
+    ...measureCanvasTextLine(context, line, line.fallbackFontSize),
+  }));
+  const totalHeight =
+    measuredLines.reduce((height, line) => height + line.ascent + line.descent, 0) +
+    lineGap * Math.max(0, measuredLines.length - 1);
+  let lineTop = centerY - totalHeight / 2;
+
+  context.textAlign = "center";
+  context.textBaseline = "alphabetic";
+
+  for (const line of measuredLines) {
+    context.font = line.font;
+    drawClippedText(
+      context,
+      line.text,
+      centerX,
+      lineTop + line.ascent,
+      clipRect.x,
+      clipRect.y,
+      clipRect.width,
+      clipRect.height
+    );
+    lineTop += line.ascent + line.descent + lineGap;
+  }
+}
+
 function drawSectorHeaderLabel(
   context: CanvasRenderingContext2D,
   rect: { x: number; y: number; width: number; titleHeight: number },
@@ -1738,46 +1815,43 @@ function drawStockLabel(
       );
       const centerX = stock.x + stock.width / 2;
       const centerY = stock.y + stock.height / 2;
-
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.font = heatmapFont(titleWeight, titleSize);
-      drawClippedText(
-        context,
-        fitTextToWidth(context, stock.name, clipWidth),
-        centerX,
-        centerY - titleSize * 0.62,
-        stock.x + clipPadding,
-        stock.y + clipPadding,
-        clipWidth,
-        clipHeight
-      );
-
-      context.font = heatmapFont(detailWeight, detailSize);
-      drawClippedText(
-        context,
-        formatChange(stock.changePct),
-        centerX,
-        centerY + detailSize * 0.3,
-        stock.x + clipPadding,
-        stock.y + clipPadding,
-        clipWidth,
-        clipHeight
-      );
+      const titleFont = heatmapFont(titleWeight, titleSize);
+      context.font = titleFont;
+      const lines: Array<CanvasTextLine & { fallbackFontSize: number }> = [
+        {
+          text: fitTextToWidth(context, stock.name, clipWidth),
+          font: titleFont,
+          fallbackFontSize: titleSize,
+        },
+        {
+          text: formatChange(stock.changePct),
+          font: heatmapFont(detailWeight, detailSize),
+          fallbackFontSize: detailSize,
+        },
+      ];
 
       if (displayWidth > 180 && displayHeight > 100) {
-        context.font = heatmapFont(550, Math.max(11 * screenUnit, detailSize - 1 * screenUnit));
-        drawClippedText(
-          context,
-          formatPrice(stock.price),
-          centerX,
-          centerY + detailSize * 1.35,
-          stock.x + clipPadding,
-          stock.y + clipPadding,
-          clipWidth,
-          clipHeight
-        );
+        const priceSize = Math.max(11 * screenUnit, detailSize - 1 * screenUnit);
+        lines.push({
+          text: formatPrice(stock.price),
+          font: heatmapFont(550, priceSize),
+          fallbackFontSize: priceSize,
+        });
       }
+
+      drawCenteredTextStack(
+        context,
+        lines,
+        centerX,
+        centerY,
+        Math.max(3 * screenUnit, Math.min(titleSize, detailSize) * 0.12),
+        {
+          x: stock.x + clipPadding,
+          y: stock.y + clipPadding,
+          width: clipWidth,
+          height: clipHeight,
+        }
+      );
       return;
     }
 
@@ -1947,6 +2021,43 @@ function usePollWhileVisible(task: () => void | Promise<void>, intervalMs: numbe
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [task, intervalMs]);
+}
+
+async function readQuoteStream(
+  response: Response,
+  onEvent: (event: QuoteStreamEvent) => void
+) {
+  if (!response.body) {
+    throw new Error("Streaming response body is unavailable");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const consumeLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    onEvent(JSON.parse(trimmed) as QuoteStreamEvent);
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      consumeLine(line);
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  consumeLine(buffer);
 }
 
 function useIsMobile() {
@@ -4315,6 +4426,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const [marketSummaries, setMarketSummaries] = useState<Partial<Record<MarketKey, MarketSummary>>>({});
   const [treemapData, setTreemapData] = useState<TreemapResponse | null>(null);
   const [quotes, setQuotes] = useState<QuoteMap>({});
+  const [settledQuotes, setSettledQuotes] = useState<QuoteMap>({});
+  const [quoteLoadProgress, setQuoteLoadProgress] = useState<QuoteLoadProgress | null>(null);
   const [dataSource, setDataSource] = useState<MarketDataSource | null>(null);
   // The bundled sample snapshot is fetched once on mount and reused as an instant
   // pre-preference fallback so the very first render can already paint a full Canvas.
@@ -4386,6 +4499,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const lastStockRectsRef = useRef<StockRect[]>([]);
   const lastBoardRectsRef = useRef<BoardRect[]>([]);
   const lastSubBoardRectsRef = useRef<SubBoardRect[]>([]);
+  const quoteStreamRef = useRef<{ key: string; controller: AbortController } | null>(null);
   const sidebarFilterTriggerRef = useRef<HTMLButtonElement>(null);
   const filterTriggerRefs = useMemo(() => [sidebarFilterTriggerRef], []);
   const filterHoverOpenTimerRef = useRef<number | null>(null);
@@ -4794,6 +4908,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         if (codes.length === 0) {
           setTreemapData(createEmptyWatchlistTreemap(nextPeriod));
           setQuotes({});
+          setSettledQuotes({});
+          setQuoteLoadProgress(null);
           setUpdatedAt("");
           setDataSource(null);
           return;
@@ -4810,8 +4926,13 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
         const payload = (await response.json()) as TreemapResponse;
         setTreemapData(payload);
-        setUpdatedAt(payload.updatedAt);
-        setDataSource(payload.source);
+        if (payload.source === "fallback") {
+          setUpdatedAt((current) => current || payload.updatedAt);
+          setDataSource((current) => current ?? payload.source);
+        } else {
+          setUpdatedAt(payload.updatedAt);
+          setDataSource(payload.source);
+        }
         return;
       }
 
@@ -4822,48 +4943,117 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
       const payload = (await response.json()) as TreemapResponse;
       setTreemapData(payload);
-      setUpdatedAt(payload.updatedAt);
-      setDataSource(payload.source);
+      if (payload.source === "fallback") {
+        setUpdatedAt((current) => current || payload.updatedAt);
+        setDataSource((current) => current ?? payload.source);
+      } else {
+        setUpdatedAt(payload.updatedAt);
+        setDataSource(payload.source);
+      }
     },
     [messages.errorLoad]
   );
 
-  const fetchQuotes = useCallback(
-    async (nextMarket: HeatmapUniverse, nextPeriod: HeatmapPeriodKey, codes: string[]) => {
+  const fetchProgressiveQuotes = useCallback(
+    async (
+      nextMarket: HeatmapUniverse,
+      nextPeriod: HeatmapPeriodKey,
+      codes: string[],
+      refreshId: number
+    ) => {
       if (nextMarket === watchlistUniverseKey) {
         if (codes.length === 0) {
           setQuotes({});
+          setSettledQuotes({});
+          setQuoteLoadProgress(null);
           return;
         }
+      }
 
-        const params = new URLSearchParams({
-          period: nextPeriod,
-          codes: codes.join(","),
+      const requestKey = `${nextMarket}:${nextPeriod}:${codes.join(",")}:${refreshId}`;
+      if (quoteStreamRef.current?.key === requestKey) {
+        return;
+      }
+
+      quoteStreamRef.current?.controller.abort();
+      const controller = new AbortController();
+      quoteStreamRef.current = { key: requestKey, controller };
+      setQuoteLoadProgress({ active: true, loadedCount: 0, totalCount: 0 });
+
+      const params = new URLSearchParams({ period: nextPeriod });
+      if (nextMarket === watchlistUniverseKey) {
+        params.set("codes", codes.join(","));
+      } else {
+        params.set("market", nextMarket);
+      }
+
+      const receivedQuotes: QuoteMap = {};
+      let completed = false;
+
+      try {
+        const response = await fetch(`/api/heatmap/quotes/stream?${params.toString()}`, {
+          signal: controller.signal,
+          cache: "no-store",
         });
-        const response = await fetch(`/api/heatmap/quotes?${params.toString()}`);
         if (!response.ok) {
           throw new Error(messages.errorLoad);
         }
 
-        const payload = (await response.json()) as { updatedAt: string; quotes: QuoteMap; source?: MarketDataSource };
-        setQuotes(payload.quotes);
-        setUpdatedAt(payload.updatedAt);
-        if (payload.source) {
-          setDataSource(payload.source);
+        await readQuoteStream(response, (event) => {
+          if (event.type === "start") {
+            setQuoteLoadProgress({ active: true, loadedCount: 0, totalCount: event.totalCount });
+            return;
+          }
+
+          if (event.type === "quotes") {
+            Object.assign(receivedQuotes, event.quotes);
+            setQuotes((current) => ({ ...current, ...event.quotes }));
+            setQuoteLoadProgress({
+              active: true,
+              loadedCount: event.loadedCount,
+              totalCount: event.totalCount,
+            });
+            if (event.updatedAt) {
+              setUpdatedAt(event.updatedAt);
+            }
+            setDataSource((current) => (current === "direct" ? current : "stale"));
+            return;
+          }
+
+          if (event.type === "complete") {
+            completed = true;
+            setSettledQuotes((current) => ({ ...current, ...receivedQuotes }));
+            setQuoteLoadProgress({
+              active: false,
+              loadedCount: event.loadedCount,
+              totalCount: event.totalCount,
+            });
+            if (event.updatedAt) {
+              setUpdatedAt(event.updatedAt);
+            }
+            setDataSource(event.source);
+            setError(null);
+            return;
+          }
+
+          throw new Error(event.message);
+        });
+
+        if (!completed && !controller.signal.aborted) {
+          throw new Error(messages.errorLoad);
         }
-        return;
-      }
-
-      const response = await fetch(`/api/heatmap/quotes?market=${nextMarket}&period=${nextPeriod}`);
-      if (!response.ok) {
-        throw new Error(messages.errorLoad);
-      }
-
-      const payload = (await response.json()) as { updatedAt: string; quotes: QuoteMap; source?: MarketDataSource };
-      setQuotes(payload.quotes);
-      setUpdatedAt(payload.updatedAt);
-      if (payload.source) {
-        setDataSource(payload.source);
+      } catch (streamError) {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setQuoteLoadProgress((current) =>
+          current ? { ...current, active: false } : current
+        );
+        throw streamError;
+      } finally {
+        if (quoteStreamRef.current?.controller === controller) {
+          quoteStreamRef.current = null;
+        }
       }
     },
     [messages.errorLoad]
@@ -4986,6 +5176,21 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     };
   }, []);
 
+  const quoteQueryKey = `${market}:${period}:${isWatchlist ? watchlistCodes.join(",") : ""}`;
+
+  useEffect(() => {
+    quoteStreamRef.current?.controller.abort();
+    quoteStreamRef.current = null;
+    setQuotes({});
+    setSettledQuotes({});
+    setQuoteLoadProgress(null);
+
+    return () => {
+      quoteStreamRef.current?.controller.abort();
+      quoteStreamRef.current = null;
+    };
+  }, [quoteQueryKey]);
+
   useEffect(() => {
     if (!preferencesReady) {
       return;
@@ -5041,11 +5246,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         return;
       }
       try {
-        await fetchQuotes(market, period, watchlistCodes);
+        await fetchProgressiveQuotes(market, period, watchlistCodes, refreshRequestId);
       } catch {
         setError(messages.errorLoad);
       }
-    }, [fetchQuotes, market, messages.errorLoad, period, preferencesReady, watchlistCodes]),
+    }, [fetchProgressiveQuotes, market, messages.errorLoad, period, preferencesReady, refreshRequestId, watchlistCodes]),
     refreshIntervalSeconds * 1000
   );
 
@@ -5354,7 +5559,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       const selectedStocks = selectedBoards.flatMap((board) => board.children);
 
       for (const stock of selectedStocks) {
-        const changePct = quotes[stock.code]?.changePct ?? stock.changePct;
+        const changePct = settledQuotes[stock.code]?.changePct ?? stock.changePct;
 
         if (changePct > flatThreshold) {
           advanceCount += 1;
@@ -5364,7 +5569,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           flatCount += 1;
         }
 
-        turnoverAmount += getLiveTurnoverAmount(stock.code, stock.turnoverAmount, quotes);
+        turnoverAmount += getLiveTurnoverAmount(stock.code, stock.turnoverAmount, settledQuotes);
       }
 
       return {
@@ -5379,7 +5584,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
           turnoverAmount,
           turnoverPreviousAmount: 0,
           turnoverDelta: 0,
-          indexChangePct: weightedAverageChange(selectedStocks, quotes),
+          indexChangePct: weightedAverageChange(selectedStocks, settledQuotes),
         },
         nodes: selectedBoards,
       };
@@ -5390,7 +5595,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         return data;
       }
 
-      return filterTreemapByStockPredicate(data, quotes, (changePct) => {
+      return filterTreemapByStockPredicate(data, settledQuotes, (changePct) => {
         if (trendFilter === risingOnlyValue) {
           return changePct > flatThreshold;
         }
@@ -5408,7 +5613,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         return data;
       }
 
-      return filterTreemapByStockPredicate(data, quotes, (changePct) =>
+      return filterTreemapByStockPredicate(data, settledQuotes, (changePct) =>
         matchesChangeRange(changePct, changeRangeFilter)
       );
     };
@@ -5417,7 +5622,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     result = applyTrendFilter(result);
     result = applyChangeRangeFilter(result);
     return result;
-  }, [boardFilter, changeRangeFilter, initialSnapshot, quotes, trendFilter, treemapData]);
+  }, [boardFilter, changeRangeFilter, initialSnapshot, settledQuotes, trendFilter, treemapData]);
 
   const marketOverview = useMemo<MarketOverview | null>(() => {
     if (!visibleTreemapData) {
@@ -5435,8 +5640,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   }, [visibleTreemapData]);
 
   const sizedTreemapData = useMemo(
-    () => (visibleTreemapData ? applySizeModeToTreemapData(visibleTreemapData, quotes, sizeMode) : null),
-    [quotes, sizeMode, visibleTreemapData]
+    () => (visibleTreemapData ? applySizeModeToTreemapData(visibleTreemapData, settledQuotes, sizeMode) : null),
+    [settledQuotes, sizeMode, visibleTreemapData]
   );
 
   const layout = useMemo(() => {
@@ -7992,8 +8197,16 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
                       : "border-slate-700/70 bg-[#0f1319]/80 text-slate-300"
                   )}
                 >
-                  <Loader2 className="size-3 animate-spin text-brand" aria-hidden />
-                  {messages.loadingLiveData}
+                  <Loader2
+                    className={cn("size-3 text-brand", quoteLoadProgress?.active && "animate-spin")}
+                    aria-hidden
+                  />
+                  <span>{messages.loadingLiveData}</span>
+                  {quoteLoadProgress && quoteLoadProgress.totalCount > 0 && (
+                    <span className="tabular-nums text-muted-foreground">
+                      {quoteLoadProgress.loadedCount.toLocaleString()} / {quoteLoadProgress.totalCount.toLocaleString()}
+                    </span>
+                  )}
                 </div>
               </div>
             )}
@@ -8058,7 +8271,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
               isLightMode ? "bg-white/88 backdrop-blur-sm" : "bg-[#151a21]"
             )}
           >
-            {(loading || dataSource === "fallback") && !error && (
+            {(loading || dataSource === "fallback" || quoteLoadProgress?.active) && !error && (
               <div className="hm-bottom-loader inset-x-0 top-0 h-[2px]" aria-hidden />
             )}
             <div className="flex items-center gap-1.5 sm:gap-3">

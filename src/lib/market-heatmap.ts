@@ -37,6 +37,8 @@ type QuoteSnapshot = {
   timestamp: number;
   updatedAt: string;
   quotes: Record<string, RemoteQuoteValue>;
+  stocks?: StockSnapshot[];
+  universeComplete?: boolean;
   source: "direct";
 };
 
@@ -152,6 +154,26 @@ export type QuotesResponse = {
   source: MarketDataSource;
 };
 
+export type ProgressiveQuoteEvent =
+  | {
+      type: "start";
+      totalCount: number;
+    }
+  | {
+      type: "quotes";
+      quotes: Record<string, QuoteValue>;
+      loadedCount: number;
+      totalCount: number;
+      updatedAt: string;
+    }
+  | {
+      type: "complete";
+      loadedCount: number;
+      totalCount: number;
+      updatedAt: string;
+      source: MarketDataSource;
+    };
+
 export type MarketOverviewItem = {
   market: MarketKey;
   changePct: number;
@@ -242,8 +264,11 @@ const eastmoneyQuoteFields = [
   "f13",
   "f14",
   "f18",
+  "f20", // total market cap
+  "f21", // float market cap
   "f24", // 60-day change, used only as a defensive fallback for month
   "f25", // year-to-date change
+  "f100", // Eastmoney secondary industry
   "f109", // 5-trading-day change
   "f110", // 20-trading-day change
   "f124", // quote timestamp
@@ -271,6 +296,13 @@ const baselineStocks: StockSnapshot[] = fallbackSnapshotSeed.stocks.map((stock) 
   };
 });
 
+const sectorBySubBoardName = new Map<string, string>();
+for (const mapping of Object.values(subboardSeed.subboards)) {
+  if (!sectorBySubBoardName.has(mapping.subBoardName)) {
+    sectorBySubBoardName.set(mapping.subBoardName, mapping.sectorName);
+  }
+}
+
 let quoteCache: QuoteSnapshot | null = null;
 let quotePromise: Promise<QuoteSnapshot> | null = null;
 let summaryCache: MarketSummarySnapshot | null = null;
@@ -278,6 +310,51 @@ let summaryPromise: Promise<MarketSummarySnapshot> | null = null;
 let indexCache: MarketIndexSnapshot | null = null;
 let indexPromise: Promise<MarketIndexSnapshot> | null = null;
 let hasLoggedFallbackWarning = false;
+
+type QuoteProgressBatch = {
+  updatedAt: string;
+  quotes: Record<string, RemoteQuoteValue>;
+};
+
+type QuoteProgressListener = (batch: QuoteProgressBatch) => void;
+
+const quoteProgressListeners = new Set<QuoteProgressListener>();
+let quoteProgressActive = false;
+let quoteProgressState: QuoteProgressBatch = { updatedAt: "", quotes: {} };
+
+function beginQuoteProgress() {
+  quoteProgressActive = true;
+  quoteProgressState = { updatedAt: "", quotes: {} };
+}
+
+function publishQuoteProgress(batch: QuoteProgressBatch) {
+  if (!quoteProgressActive || Object.keys(batch.quotes).length === 0) {
+    return;
+  }
+
+  for (const [code, incoming] of Object.entries(batch.quotes)) {
+    const current = quoteProgressState.quotes[code];
+    quoteProgressState.quotes[code] = current
+      ? {
+          price: incoming.price || current.price,
+          turnoverAmount: incoming.turnoverAmount || current.turnoverAmount,
+          changes: { ...current.changes, ...incoming.changes },
+        }
+      : incoming;
+  }
+
+  if (batch.updatedAt && (!quoteProgressState.updatedAt || batch.updatedAt > quoteProgressState.updatedAt)) {
+    quoteProgressState.updatedAt = batch.updatedAt;
+  }
+
+  for (const listener of quoteProgressListeners) {
+    listener(batch);
+  }
+}
+
+function endQuoteProgress() {
+  quoteProgressActive = false;
+}
 
 function toNumber(value: number | string | undefined) {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -518,6 +595,8 @@ const staticStocksByMarket: Record<Exclude<MarketKey, "zza50">, StockSnapshot[]>
     inMarket(stock, "kcb", baselineZza50FallbackSet, baselineHs300Set, baselineZza500Set)
   ),
 };
+const dynamicIndexSetsCache = new WeakMap<StockSnapshot[], ReturnType<typeof buildDynamicIndexSets>>();
+const dynamicMarketStocksCache = new WeakMap<StockSnapshot[], Map<Exclude<MarketKey, "zza50">, StockSnapshot[]>>();
 
 async function getZza50Set(stocks: StockSnapshot[], fallbackSet: Set<string>) {
   const allowedCodes = new Set(stocks.map((stock) => stock.code));
@@ -537,10 +616,32 @@ async function filterStocks(stocks: StockSnapshot[], market: MarketKey) {
     return staticStocksByMarket[market];
   }
 
-  const { zza50FallbackSet, hs300Set, zza500Set } = buildDynamicIndexSets(stocks);
-  const zza50Set = market === "zza50" ? await getZza50Set(stocks, zza50FallbackSet) : zza50FallbackSet;
+  const cachedMarkets = dynamicMarketStocksCache.get(stocks);
+  if (market !== "zza50") {
+    const cachedStocks = cachedMarkets?.get(market);
+    if (cachedStocks) {
+      return cachedStocks;
+    }
+  }
 
-  return stocks.filter((stock) => inMarket(stock, market, zza50Set, hs300Set, zza500Set));
+  let indexSets = dynamicIndexSetsCache.get(stocks);
+  if (!indexSets) {
+    indexSets = buildDynamicIndexSets(stocks);
+    dynamicIndexSetsCache.set(stocks, indexSets);
+  }
+  const { zza50FallbackSet, hs300Set, zza500Set } = indexSets;
+  const zza50Set = market === "zza50" ? await getZza50Set(stocks, zza50FallbackSet) : zza50FallbackSet;
+  const filteredStocks = stocks.filter((stock) => inMarket(stock, market, zza50Set, hs300Set, zza500Set));
+
+  if (market !== "zza50") {
+    const marketCache = cachedMarkets ?? new Map<Exclude<MarketKey, "zza50">, StockSnapshot[]>();
+    marketCache.set(market, filteredStocks);
+    if (!cachedMarkets) {
+      dynamicMarketStocksCache.set(stocks, marketCache);
+    }
+  }
+
+  return filteredStocks;
 }
 
 function toBoardCode(name: string) {
@@ -616,8 +717,44 @@ function parseSinaQuoteBatch(rawText: string) {
   };
 }
 
+function parseEastmoneyStockRow(row: Record<string, number | string | undefined>): StockSnapshot | null {
+  const code = parseEastmoneyCode(row.f12, row.f13);
+  if (!code) {
+    return null;
+  }
+
+  const previous = baselineStockByCode.get(code);
+  const name = String(row.f14 ?? previous?.name ?? "").trim();
+  if (!name) {
+    return null;
+  }
+
+  const exchange = code.endsWith(".SH") ? "SH" : code.endsWith(".BJ") ? "BJ" : "SZ";
+  const remoteSubBoardName = String(row.f100 ?? "").trim().replace(/Ⅱ$/, "");
+  const subBoardName =
+    (remoteSubBoardName && remoteSubBoardName !== "-" ? remoteSubBoardName : "") ||
+    previous?.subBoardName ||
+    previous?.boardName ||
+    "其他";
+  const boardName = sectorBySubBoardName.get(subBoardName) ?? previous?.boardName ?? "其他";
+
+  return {
+    code,
+    exchange,
+    name,
+    boardName,
+    subBoardName,
+    price: toFiniteNumber(row.f2) ?? previous?.price ?? 0,
+    changePct: toFiniteNumber(row.f3) ?? previous?.changePct ?? 0,
+    totalMarketCap: toFiniteNumber(row.f20) ?? previous?.totalMarketCap ?? 0,
+    floatMarketCap: toFiniteNumber(row.f21) ?? previous?.floatMarketCap ?? 0,
+    turnoverAmount: toFiniteNumber(row.f6) ?? previous?.turnoverAmount ?? 0,
+  };
+}
+
 function parseEastmoneyQuoteBatch(payload: unknown) {
   const quotes: Record<string, RemoteQuoteValue> = {};
+  const stocks: StockSnapshot[] = [];
   let updatedAt = "";
   const diff = (payload as { data?: { diff?: unknown[] } }).data?.diff;
 
@@ -625,6 +762,7 @@ function parseEastmoneyQuoteBatch(payload: unknown) {
     return {
       updatedAt: new Date().toISOString(),
       quotes,
+      stocks,
     };
   }
 
@@ -633,6 +771,11 @@ function parseEastmoneyQuoteBatch(payload: unknown) {
     const code = parseEastmoneyCode(row.f12, row.f13);
     if (!code) {
       continue;
+    }
+
+    const stock = parseEastmoneyStockRow(row);
+    if (stock) {
+      stocks.push(stock);
     }
 
     const price = toFiniteNumber(row.f2) ?? 0;
@@ -668,6 +811,7 @@ function parseEastmoneyQuoteBatch(payload: unknown) {
   return {
     updatedAt: updatedAt || new Date().toISOString(),
     quotes,
+    stocks,
   };
 }
 
@@ -786,8 +930,9 @@ async function fetchEastmoneyUlistBatch(secids: string[]) {
   throw lastError instanceof Error ? lastError : new Error("Eastmoney ulist request failed");
 }
 
-async function fetchEastmoneyClistPages(fs: string) {
+async function fetchEastmoneyClistPages(fs: string, onPayload?: (payload: unknown) => void) {
   const firstPayload = await fetchEastmoneyClistPage(fs, 1);
+  onPayload?.(firstPayload);
   const total = toFiniteNumber((firstPayload as { data?: { total?: number | string } }).data?.total) ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / eastmoneyClistPageSize));
   const pageNumbers = Array.from({ length: pageCount }, (_, index) => index + 1);
@@ -797,7 +942,9 @@ async function fetchEastmoneyClistPages(fs: string) {
     }
 
     try {
-      return await fetchEastmoneyClistPage(fs, page);
+      const payload = await fetchEastmoneyClistPage(fs, page);
+      onPayload?.(payload);
+      return payload;
     } catch {
       return null;
     }
@@ -815,7 +962,10 @@ async function fetchEastmoneyClistPages(fs: string) {
     );
   }
 
-  return successfulPayloads;
+  return {
+    payloads: successfulPayloads,
+    total,
+  };
 }
 
 async function fetchSinaQuoteBatch(symbols: string[]) {
@@ -915,7 +1065,7 @@ function parseEastmoneyIndexBatch(payload: unknown) {
 }
 
 async function fetchEastmoneyMarketIndexSnapshotFromClist(): Promise<MarketIndexSnapshot> {
-  const payloads = await fetchEastmoneyClistPages(eastmoneyIndexFs);
+  const { payloads } = await fetchEastmoneyClistPages(eastmoneyIndexFs);
   const summaries: Partial<Record<MarketKey, MarketIndexValue>> = {};
 
   for (const payload of payloads) {
@@ -996,13 +1146,20 @@ async function fetchMarketIndexSnapshotFromRemote(): Promise<MarketIndexSnapshot
 }
 
 async function fetchEastmoneyQuoteSnapshotFromClist(): Promise<QuoteSnapshot> {
-  const payloads = await fetchEastmoneyClistPages(eastmoneyAsharesFs);
+  const { payloads, total } = await fetchEastmoneyClistPages(eastmoneyAsharesFs, (payload) => {
+    const result = parseEastmoneyQuoteBatch(payload);
+    publishQuoteProgress({ updatedAt: result.updatedAt, quotes: result.quotes });
+  });
   const quotes: Record<string, RemoteQuoteValue> = {};
+  const stocksByCode = new Map<string, StockSnapshot>();
   let updatedAt = "";
 
   for (const payload of payloads) {
     const result = parseEastmoneyQuoteBatch(payload);
     Object.assign(quotes, result.quotes);
+    for (const stock of result.stocks) {
+      stocksByCode.set(stock.code, stock);
+    }
     if (result.updatedAt && (!updatedAt || result.updatedAt > updatedAt)) {
       updatedAt = result.updatedAt;
     }
@@ -1016,6 +1173,8 @@ async function fetchEastmoneyQuoteSnapshotFromClist(): Promise<QuoteSnapshot> {
     timestamp: Date.now(),
     updatedAt: updatedAt || new Date().toISOString(),
     quotes,
+    stocks: Array.from(stocksByCode.values()),
+    universeComplete: total > 0 && stocksByCode.size >= total * 0.95,
     source: "direct",
   };
 }
@@ -1030,13 +1189,17 @@ async function fetchEastmoneyQuoteSnapshotFromUlist(): Promise<QuoteSnapshot> {
 
   const payloads = await mapWithConcurrency(batches, eastmoneyUlistConcurrency, async (batch) => {
     try {
-      return await fetchEastmoneyUlistBatch(batch);
+      const payload = await fetchEastmoneyUlistBatch(batch);
+      const result = parseEastmoneyQuoteBatch(payload);
+      publishQuoteProgress({ updatedAt: result.updatedAt, quotes: result.quotes });
+      return payload;
     } catch {
       return null;
     }
   });
 
   const quotes: Record<string, RemoteQuoteValue> = {};
+  const stocksByCode = new Map<string, StockSnapshot>();
   let updatedAt = "";
   let successfulBatches = 0;
 
@@ -1048,6 +1211,9 @@ async function fetchEastmoneyQuoteSnapshotFromUlist(): Promise<QuoteSnapshot> {
     successfulBatches += 1;
     const result = parseEastmoneyQuoteBatch(payload);
     Object.assign(quotes, result.quotes);
+    for (const stock of result.stocks) {
+      stocksByCode.set(stock.code, stock);
+    }
     if (result.updatedAt && (!updatedAt || result.updatedAt > updatedAt)) {
       updatedAt = result.updatedAt;
     }
@@ -1063,6 +1229,8 @@ async function fetchEastmoneyQuoteSnapshotFromUlist(): Promise<QuoteSnapshot> {
     timestamp: Date.now(),
     updatedAt: updatedAt || new Date().toISOString(),
     quotes,
+    stocks: Array.from(stocksByCode.values()),
+    universeComplete: false,
     source: "direct",
   };
 }
@@ -1084,7 +1252,13 @@ async function fetchSinaQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
     batches.push(symbols.slice(index, index + sinaBatchSize));
   }
 
-  const results = await Promise.all(batches.map((batch) => fetchSinaQuoteBatch(batch)));
+  const results = await Promise.all(
+    batches.map(async (batch) => {
+      const result = await fetchSinaQuoteBatch(batch);
+      publishQuoteProgress({ updatedAt: result.updatedAt, quotes: result.quotes });
+      return result;
+    })
+  );
   const quotes: Record<string, RemoteQuoteValue> = {};
   let updatedAt = "";
 
@@ -1109,6 +1283,51 @@ async function fetchSinaQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
 
 function countBaselineQuoteCoverage(quotes: Record<string, RemoteQuoteValue>) {
   return baselineStocks.reduce((count, stock) => (quotes[stock.code] ? count + 1 : count), 0);
+}
+
+function mergeStockSnapshots(primary: QuoteSnapshot, secondary: QuoteSnapshot | null) {
+  if (primary.universeComplete && primary.stocks?.length) {
+    return {
+      stocks: primary.stocks,
+      universeComplete: true,
+    };
+  }
+
+  if (secondary?.universeComplete && secondary.stocks?.length) {
+    return {
+      stocks: secondary.stocks,
+      universeComplete: true,
+    };
+  }
+
+  const stocksByCode = new Map<string, StockSnapshot>();
+  for (const stock of primary.stocks ?? []) {
+    stocksByCode.set(stock.code, stock);
+  }
+  for (const stock of secondary?.stocks ?? []) {
+    stocksByCode.set(stock.code, stock);
+  }
+
+  return {
+    stocks: Array.from(stocksByCode.values()),
+    universeComplete: false,
+  };
+}
+
+function getStocksForQuoteSnapshot(snapshot: QuoteSnapshot) {
+  if (snapshot.universeComplete && snapshot.stocks?.length) {
+    return snapshot.stocks;
+  }
+
+  if (!snapshot.stocks?.length) {
+    return baselineStocks;
+  }
+
+  const stocksByCode = new Map(baselineStocks.map((stock) => [stock.code, stock]));
+  for (const stock of snapshot.stocks) {
+    stocksByCode.set(stock.code, stock);
+  }
+  return Array.from(stocksByCode.values());
 }
 
 function mergeQuoteSnapshots(
@@ -1139,6 +1358,7 @@ function mergeQuoteSnapshots(
       },
     };
   }
+  const universe = mergeStockSnapshots(primary, secondary);
 
   return {
     timestamp: Date.now(),
@@ -1149,6 +1369,8 @@ function mergeQuoteSnapshots(
           : secondary.updatedAt
         : primary.updatedAt || secondary.updatedAt,
     quotes,
+    stocks: universe.stocks,
+    universeComplete: universe.universeComplete,
     source: "direct",
   };
 }
@@ -1241,6 +1463,7 @@ async function getQuoteSnapshot() {
     return quotePromise;
   }
 
+  beginQuoteProgress();
   quotePromise = fetchQuoteSnapshotFromRemote()
     .then((snapshot) => {
       quoteCache = snapshot;
@@ -1254,10 +1477,111 @@ async function getQuoteSnapshot() {
       throw error;
     })
     .finally(() => {
+      endQuoteProgress();
       quotePromise = null;
     });
 
   return quotePromise;
+}
+
+function quoteValueForPeriod(quote: RemoteQuoteValue, period: HeatmapPeriodKey): QuoteValue | null {
+  const changePct = quote.changes[period];
+  if (typeof changePct !== "number" || !Number.isFinite(changePct)) {
+    return null;
+  }
+
+  return {
+    price: quote.price,
+    changePct,
+    turnoverAmount: quote.turnoverAmount,
+  };
+}
+
+export async function streamQuoteData(options: {
+  market: MarketKey;
+  period: HeatmapPeriodKey;
+  codes?: string[];
+  signal?: AbortSignal;
+  emit: (event: ProgressiveQuoteEvent) => void;
+}) {
+  const stocks = options.codes?.length
+    ? resolveStocksByCodes(options.codes)
+    : await filterStocks(baselineStocks, options.market);
+  const orderedStocks = [...stocks].sort((left, right) => getStockValue(right) - getStockValue(left));
+  const allowedCodes = new Set(orderedStocks.map((stock) => stock.code));
+  const deliveredCodes = new Set<string>();
+  const totalCount = orderedStocks.length;
+  let latestUpdatedAt = "";
+
+  const emitBatch = (batch: QuoteProgressBatch) => {
+    if (options.signal?.aborted) {
+      return;
+    }
+
+    const quotes: Record<string, QuoteValue> = {};
+    for (const [code, remoteQuote] of Object.entries(batch.quotes)) {
+      if (!allowedCodes.has(code) || deliveredCodes.has(code)) {
+        continue;
+      }
+
+      const quote = quoteValueForPeriod(remoteQuote, options.period);
+      if (!quote) {
+        continue;
+      }
+
+      quotes[code] = quote;
+      deliveredCodes.add(code);
+    }
+
+    if (Object.keys(quotes).length === 0) {
+      return;
+    }
+
+    if (batch.updatedAt && (!latestUpdatedAt || batch.updatedAt > latestUpdatedAt)) {
+      latestUpdatedAt = batch.updatedAt;
+    }
+
+    options.emit({
+      type: "quotes",
+      quotes,
+      loadedCount: deliveredCodes.size,
+      totalCount,
+      updatedAt: latestUpdatedAt,
+    });
+  };
+
+  options.emit({ type: "start", totalCount });
+  quoteProgressListeners.add(emitBatch);
+
+  try {
+    if (quoteProgressActive && Object.keys(quoteProgressState.quotes).length > 0) {
+      emitBatch(quoteProgressState);
+    }
+
+    const snapshot = await getQuoteSnapshot();
+    const finalEntries = orderedStocks
+      .map((stock) => [stock.code, snapshot.quotes[stock.code]] as const)
+      .filter((entry): entry is readonly [string, RemoteQuoteValue] => Boolean(entry[1]));
+
+    for (let index = 0; index < finalEntries.length; index += sinaBatchSize) {
+      emitBatch({
+        updatedAt: snapshot.updatedAt,
+        quotes: Object.fromEntries(finalEntries.slice(index, index + sinaBatchSize)),
+      });
+    }
+
+    const source: MarketDataSource =
+      totalCount === 0 || deliveredCodes.size >= totalCount * 0.9 ? "direct" : "stale";
+    options.emit({
+      type: "complete",
+      loadedCount: deliveredCodes.size,
+      totalCount,
+      updatedAt: latestUpdatedAt || snapshot.updatedAt,
+      source,
+    });
+  } finally {
+    quoteProgressListeners.delete(emitBatch);
+  }
 }
 
 async function fetchMarketSummaryFromRemote(): Promise<MarketSummarySnapshot> {
@@ -1604,9 +1928,20 @@ export function searchStocks(query: string, limit = 12): StockSearchItem[] {
   }));
 }
 
-export function resolveStocksByCodes(rawCodes: string[]) {
+export function resolveStocksByCodes(rawCodes: string[], stocks: StockSnapshot[] = baselineStocks) {
   const resolved: StockSnapshot[] = [];
   const seen = new Set<string>();
+  const stockByCode = stocks === baselineStocks ? baselineStockByCode : new Map(stocks.map((stock) => [stock.code, stock]));
+  const stocksBySymbol = stocks === baselineStocks ? baselineStocksBySymbol : new Map<string, StockSnapshot[]>();
+
+  if (stocks !== baselineStocks) {
+    for (const stock of stocks) {
+      const symbol = stock.code.split(".")[0];
+      const matches = stocksBySymbol.get(symbol) ?? [];
+      matches.push(stock);
+      stocksBySymbol.set(symbol, matches);
+    }
+  }
 
   for (const raw of rawCodes) {
     const token = normalizeStockToken(raw);
@@ -1619,19 +1954,19 @@ export function resolveStocksByCodes(rawCodes: string[]) {
     const prefixed = token.match(/^(SH|SZ|BJ)(\d{6})$/);
 
     if (dotted) {
-      const stock = baselineStockByCode.get(`${dotted[1]}.${dotted[2]}`);
+      const stock = stockByCode.get(`${dotted[1]}.${dotted[2]}`);
       if (stock) {
         matches = [stock];
       }
     } else if (prefixed) {
-      const stock = baselineStockByCode.get(`${prefixed[2]}.${prefixed[1]}`);
+      const stock = stockByCode.get(`${prefixed[2]}.${prefixed[1]}`);
       if (stock) {
         matches = [stock];
       }
     } else if (/^\d{6}$/.test(token)) {
-      matches = baselineStocksBySymbol.get(token) ?? [];
+      matches = stocksBySymbol.get(token) ?? [];
     } else {
-      const stock = baselineStockByCode.get(token);
+      const stock = stockByCode.get(token);
       if (stock) {
         matches = [stock];
       }
@@ -1767,7 +2102,8 @@ export async function getTreemapData(
 
   hasLoggedFallbackWarning = false;
 
-  const marketStocks = await filterStocks(baselineStocks, market);
+  const quoteStocks = getStocksForQuoteSnapshot(quoteResult.value);
+  const marketStocks = await filterStocks(quoteStocks, market);
   const nodes = buildNodesFromStocks(marketStocks, quoteResult.value.quotes, period);
   const computedSummary = summarizeStocks(marketStocks, quoteResult.value.quotes, period);
   const computedIndexChangePct = weightedChangePct(marketStocks, quoteResult.value.quotes, period);
@@ -1833,7 +2169,8 @@ export async function getQuoteData(
 
   hasLoggedFallbackWarning = false;
 
-  const marketStocks = await filterStocks(baselineStocks, market);
+  const quoteStocks = getStocksForQuoteSnapshot(quoteResult[0].value);
+  const marketStocks = await filterStocks(quoteStocks, market);
   const quotes: Record<string, QuoteValue> = {};
 
   for (const stock of marketStocks) {
@@ -1859,7 +2196,7 @@ export async function getTreemapDataByCodes(
   rawCodes: string[],
   period: HeatmapPeriodKey = "day"
 ): Promise<TreemapResponse> {
-  const stocks = resolveStocksByCodes(rawCodes);
+  const fallbackStocks = resolveStocksByCodes(rawCodes);
   const quoteResult = await Promise.allSettled([getQuoteSnapshot()]);
 
   if (quoteResult[0].status !== "fulfilled") {
@@ -1870,11 +2207,12 @@ export async function getTreemapDataByCodes(
       hasLoggedFallbackWarning = true;
     }
 
-    return getFallbackTreemapDataFromStocks(stocks, period);
+    return getFallbackTreemapDataFromStocks(fallbackStocks, period);
   }
 
   hasLoggedFallbackWarning = false;
 
+  const stocks = resolveStocksByCodes(rawCodes, getStocksForQuoteSnapshot(quoteResult[0].value));
   const liveQuotes = quoteResult[0].value.quotes;
   const nodes = buildNodesFromStocks(stocks, liveQuotes, period);
   const computedSummary = summarizeStocks(stocks, liveQuotes, period);
@@ -1899,7 +2237,7 @@ export async function getQuoteDataByCodes(
   period: HeatmapPeriodKey = "day",
   metric?: MetricKey
 ): Promise<QuotesResponse> {
-  const stocks = resolveStocksByCodes(rawCodes);
+  const fallbackStocks = resolveStocksByCodes(rawCodes);
   const quoteResult = await Promise.allSettled([getQuoteSnapshot()]);
 
   if (quoteResult[0].status !== "fulfilled") {
@@ -1910,11 +2248,12 @@ export async function getQuoteDataByCodes(
       hasLoggedFallbackWarning = true;
     }
 
-    return getFallbackQuoteDataFromStocks(stocks, period, metric);
+    return getFallbackQuoteDataFromStocks(fallbackStocks, period, metric);
   }
 
   hasLoggedFallbackWarning = false;
 
+  const stocks = resolveStocksByCodes(rawCodes, getStocksForQuoteSnapshot(quoteResult[0].value));
   const quotes: Record<string, QuoteValue> = {};
 
   for (const stock of stocks) {
@@ -2001,11 +2340,12 @@ export async function getOverviewData(
   hasLoggedFallbackWarning = false;
 
   const liveQuotes = quoteResult.value.quotes;
+  const quoteStocks = getStocksForQuoteSnapshot(quoteResult.value);
   const indexSummaries = indexResult.status === "fulfilled" ? indexResult.value.summaries : null;
 
   const markets: MarketOverviewItem[] = await Promise.all(
     marketKeys.map(async (market) => {
-      const stocks = await filterStocks(baselineStocks, market);
+      const stocks = await filterStocks(quoteStocks, market);
       const remoteIndex = indexSummaries?.[market];
       const remoteIndexChange = getChangeForPeriod(remoteIndex?.changes, period, Number.NaN);
       const changePct = Number.isFinite(remoteIndexChange)
