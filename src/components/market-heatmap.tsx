@@ -95,6 +95,7 @@ import {
   isHeatmapPeriodKey,
   isHeatmapUniverse,
   marketKeys,
+  periodDataUnavailableCode,
   watchlistMaxCount,
   watchlistUniverseKey,
   getBundledSnapshotTreemap,
@@ -145,7 +146,7 @@ type InspectorStockItem = {
   name: string;
   subBoardName: string;
   price: number;
-  changePct: number;
+  changePct: number | null;
   turnoverAmount: number;
   marketCap: number;
 };
@@ -161,7 +162,7 @@ type StockRect = {
   width: number;
   height: number;
   price: number;
-  changePct: number;
+  changePct: number | null;
 };
 
 type BoardTrendStats = {
@@ -171,7 +172,7 @@ type BoardTrendStats = {
 };
 
 type SectorVisualStats = BoardTrendStats & {
-  changePct: number;
+  changePct: number | null;
 };
 
 type BoardRect = {
@@ -182,7 +183,7 @@ type BoardRect = {
   height: number;
   stockCount: number;
   titleHeight: number;
-  changePct: number;
+  changePct: number | null;
   advanceCount: number;
   flatCount: number;
   declineCount: number;
@@ -197,7 +198,7 @@ type SubBoardRect = {
   height: number;
   stockCount: number;
   titleHeight: number;
-  changePct: number;
+  changePct: number | null;
   advanceCount: number;
   flatCount: number;
   declineCount: number;
@@ -599,7 +600,10 @@ function formatPrice(value: number) {
   return value.toFixed(value >= 100 ? 1 : 2);
 }
 
-function formatChange(value: number) {
+function formatChange(value: number | null) {
+  if (value === null || !Number.isFinite(value)) {
+    return "—";
+  }
   if (value > 0) {
     return `+${value.toFixed(2)}%`;
   }
@@ -607,7 +611,10 @@ function formatChange(value: number) {
   return `${value.toFixed(2)}%`;
 }
 
-function formatCompactChange(value: number) {
+function formatCompactChange(value: number | null) {
+  if (value === null || !Number.isFinite(value)) {
+    return "—";
+  }
   const absValue = Math.abs(value);
   const digits = absValue >= 10 ? 1 : 2;
   const text = trimTrailingZeros(value.toFixed(digits));
@@ -618,7 +625,7 @@ function formatBoardTrendCounts(messages: HeatmapMessages, advanceCount: number,
   return messages.boardTrendCounts.replace("{advance}", String(advanceCount)).replace("{decline}", String(declineCount));
 }
 
-function countStockTrends(stocks: Array<{ code: string; changePct: number }>, quotes: QuoteMap): BoardTrendStats {
+function countStockTrends(stocks: Array<{ code: string; changePct: number | null }>, quotes: QuoteMap): BoardTrendStats {
   let advanceCount = 0;
   let flatCount = 0;
   let declineCount = 0;
@@ -626,6 +633,9 @@ function countStockTrends(stocks: Array<{ code: string; changePct: number }>, qu
   for (const stock of stocks) {
     const changePct = quotes[stock.code]?.changePct ?? stock.changePct;
 
+    if (changePct === null) {
+      continue;
+    }
     if (changePct > flatThreshold) {
       advanceCount += 1;
     } else if (changePct < -flatThreshold) {
@@ -705,7 +715,7 @@ function filterTreemapByStockPredicate(
     .map((node) => {
       const filteredChildren = node.children.filter((stock) => {
         const changePct = quotes[stock.code]?.changePct ?? stock.changePct;
-        return predicate(changePct);
+        return changePct !== null && predicate(changePct);
       });
 
       return {
@@ -727,11 +737,11 @@ function filterTreemapByStockPredicate(
     for (const stock of node.children) {
       const changePct = quotes[stock.code]?.changePct ?? stock.changePct;
 
-      if (changePct > flatThreshold) {
+      if (changePct !== null && changePct > flatThreshold) {
         advanceCount += 1;
-      } else if (changePct < -flatThreshold) {
+      } else if (changePct !== null && changePct < -flatThreshold) {
         declineCount += 1;
-      } else {
+      } else if (changePct !== null) {
         flatCount += 1;
       }
 
@@ -910,11 +920,11 @@ function InspectorHeaderSparkline({
   className,
 }: {
   code: string;
-  changePct: number;
+  changePct: number | null;
   priceColorMode: PriceColorMode;
   className?: string;
 }) {
-  const isFlat = Math.abs(changePct) < 0.1;
+  const isFlat = changePct === null || Math.abs(changePct) < 0.1;
   // 原图已是涨红跌绿；仅在「绿涨红跌」模式下交换 R/G，灰网格几乎不变。
   const shouldSwapRg = !isFlat && priceColorMode === "green-rise";
 
@@ -970,12 +980,16 @@ function getInspectorSortLabel(messages: HeatmapMessages, sortKey: InspectorSort
 }
 
 function compareInspectorStocks(left: InspectorStockItem, right: InspectorStockItem, sortKey: InspectorSortKey) {
+  if (sortKey === "changeDesc" || sortKey === "changeAsc" || sortKey === "changeAbs") {
+    if (left.changePct === null) return right.changePct === null ? 0 : 1;
+    if (right.changePct === null) return -1;
+  }
   if (sortKey === "changeDesc") {
-    return right.changePct - left.changePct;
+    return right.changePct! - left.changePct!;
   }
 
   if (sortKey === "changeAsc") {
-    return left.changePct - right.changePct;
+    return left.changePct! - right.changePct!;
   }
 
   if (sortKey === "turnover") {
@@ -986,7 +1000,7 @@ function compareInspectorStocks(left: InspectorStockItem, right: InspectorStockI
     return left.name.localeCompare(right.name, "zh");
   }
 
-  return Math.abs(right.changePct) - Math.abs(left.changePct);
+  return Math.abs(right.changePct!) - Math.abs(left.changePct!);
 }
 
 function cycleInspectorSortKey(current: InspectorSortKey, direction: 1 | -1): InspectorSortKey {
@@ -1151,11 +1165,11 @@ function getCompactPeriodLabel(period: HeatmapPeriodKey, locale: Locale) {
 
 function getHeatColor(
   theme: HeatTheme,
-  changePct: number,
+  changePct: number | null,
   colorMode: PriceColorMode,
   displayMode: DisplayMode = "dark"
 ) {
-  return heatColorFromTheme(theme, changePct, colorMode === "red-rise", displayMode);
+  return heatColorFromTheme(theme, changePct ?? 0, colorMode === "red-rise", displayMode);
 }
 
 function getLegendGradient(theme: HeatTheme, colorMode: PriceColorMode, displayMode: DisplayMode = "dark") {
@@ -1164,21 +1178,21 @@ function getLegendGradient(theme: HeatTheme, colorMode: PriceColorMode, displayM
 
 function getBoardHeaderColor(
   theme: HeatTheme,
-  changePct: number,
+  changePct: number | null,
   colorMode: PriceColorMode,
   displayMode: DisplayMode = "dark"
 ) {
-  return boardHeaderColorFromTheme(theme, changePct, colorMode === "red-rise", displayMode);
+  return boardHeaderColorFromTheme(theme, changePct ?? 0, colorMode === "red-rise", displayMode);
 }
 
 function getChangeTextColor(
   theme: HeatTheme,
-  changePct: number,
+  changePct: number | null,
   colorMode: PriceColorMode,
   displayMode: DisplayMode,
   tone: "normal" | "soft" | "strong" = "normal"
 ) {
-  return uiChangeTextColor(theme, changePct, colorMode === "red-rise", displayMode, tone);
+  return uiChangeTextColor(theme, changePct ?? 0, colorMode === "red-rise", displayMode, tone);
 }
 
 function getRiseTextColor(theme: HeatTheme, colorMode: PriceColorMode, displayMode: DisplayMode) {
@@ -1190,7 +1204,7 @@ function getFallTextColor(theme: HeatTheme, colorMode: PriceColorMode, displayMo
 }
 
 function weightedAverageChange(
-  stocks: Array<{ code: string; value: number; changePct: number }>,
+  stocks: Array<{ code: string; value: number; changePct: number | null }>,
   quotes: QuoteMap
 ) {
   let weightedSum = 0;
@@ -1198,12 +1212,15 @@ function weightedAverageChange(
 
   for (const stock of stocks) {
     const changePct = quotes[stock.code]?.changePct ?? stock.changePct;
+    if (changePct === null) {
+      continue;
+    }
     weightedSum += changePct * stock.value;
     totalValue += stock.value;
   }
 
   if (totalValue <= 0) {
-    return 0;
+    return null;
   }
 
   return weightedSum / totalValue;
@@ -1258,7 +1275,7 @@ function groupStocksBySubBoard<
     boardName: string;
     subBoardName: string;
     value: number;
-    changePct: number;
+    changePct: number | null;
   },
 >(stocks: T[]) {
   const subBoardMap = new Map<string, T[]>();
@@ -1558,7 +1575,7 @@ function drawSectorHeaderLabel(
   rect: { x: number; y: number; width: number; titleHeight: number },
   options: {
     name: string;
-    changePct: number;
+    changePct: number | null;
     advanceCount: number;
     declineCount: number;
     messages: HeatmapMessages;
@@ -2149,7 +2166,7 @@ type MobileStockSheetStock = {
   name: string;
   subBoardName: string;
   price: number;
-  changePct: number;
+  changePct: number | null;
   active?: boolean;
 };
 
@@ -2176,7 +2193,7 @@ function MobileStockSheet({
   sectorStats: {
     advanceCount: number;
     declineCount: number;
-    changePct: number;
+    changePct: number | null;
   } | null;
   messages: HeatmapMessages;
   priceColorMode: PriceColorMode;
@@ -4493,6 +4510,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const [initialSnapshot] = useState<TreemapResponse | null>(() => getBundledSnapshotTreemap());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const periodDataUnavailable = error === periodDataUnavailableCode;
   const [refreshRequestId, setRefreshRequestId] = useState(0);
   const [updatedAt, setUpdatedAt] = useState("");
   // Set once the Canvas has painted the bundled sample — from then on the sample
@@ -5044,6 +5062,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
         });
         const response = await fetch(`/api/heatmap/treemap?${params.toString()}`);
         if (!response.ok) {
+          if (response.status === 503) throw new Error(periodDataUnavailableCode);
           throw new Error(messages.errorLoad);
         }
 
@@ -5061,6 +5080,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
       const response = await fetch(`/api/heatmap/treemap?market=${nextMarket}&period=${nextPeriod}`);
       if (!response.ok) {
+        if (response.status === 503) throw new Error(periodDataUnavailableCode);
         throw new Error(messages.errorLoad);
       }
 
@@ -5165,11 +5185,13 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
               setUpdatedAt(event.updatedAt);
             }
             setDataSource(event.source);
-            setError(null);
+            setError((current) => current === periodDataUnavailableCode ? current : null);
             return;
           }
 
-          throw new Error(event.message);
+          throw new Error(
+            event.message === periodDataUnavailableCode ? periodDataUnavailableCode : messages.errorLoad
+          );
         });
 
         if (!completed && !controller.signal.aborted) {
@@ -5322,6 +5344,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     setQuotes({});
     setSettledQuotes({});
     setQuoteLoadProgress(null);
+    setMarketSummaries({});
 
     return () => {
       quoteStreamRef.current?.controller.abort();
@@ -5340,6 +5363,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
     async function loadTreemap() {
       setError(null);
+      setTreemapData((current) => current?.period === period ? current : null);
       setHoveredStockCode(null);
       setHoveredBoardName(null);
       setHoveredBoardTitleName(null);
@@ -5362,9 +5386,9 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
 
       try {
         await fetchTreemap(market, period, watchlistCodes);
-      } catch {
+      } catch (error) {
         if (!cancelled) {
-          setError(messages.errorLoad);
+          setError(error instanceof Error ? error.message : messages.errorLoad);
         }
       } finally {
         if (!cancelled) {
@@ -5387,8 +5411,8 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       }
       try {
         await fetchProgressiveQuotes(market, period, watchlistCodes, refreshRequestId);
-      } catch {
-        setError(messages.errorLoad);
+      } catch (error) {
+        setError(error instanceof Error ? error.message : messages.errorLoad);
       }
     }, [fetchProgressiveQuotes, market, messages.errorLoad, period, preferencesReady, refreshRequestId, watchlistCodes]),
     refreshIntervalSeconds * 1000
@@ -5673,7 +5697,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   // Before live data arrives, fall back to the bundled sample snapshot so the canvas
   // always has a full heatmap to paint — even on the very first render.
   const visibleTreemapData = useMemo<TreemapResponse | null>(() => {
-    if (!treemapData) {
+    if (!treemapData || treemapData.period !== period) {
       return initialSnapshot;
     }
 
@@ -5701,11 +5725,11 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       for (const stock of selectedStocks) {
         const changePct = settledQuotes[stock.code]?.changePct ?? stock.changePct;
 
-        if (changePct > flatThreshold) {
+        if (changePct !== null && changePct > flatThreshold) {
           advanceCount += 1;
-        } else if (changePct < -flatThreshold) {
+        } else if (changePct !== null && changePct < -flatThreshold) {
           declineCount += 1;
-        } else {
+        } else if (changePct !== null) {
           flatCount += 1;
         }
 
@@ -5762,10 +5786,10 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
     result = applyTrendFilter(result);
     result = applyChangeRangeFilter(result);
     return result;
-  }, [boardFilter, changeRangeFilter, initialSnapshot, settledQuotes, trendFilter, treemapData]);
+  }, [boardFilter, changeRangeFilter, initialSnapshot, period, settledQuotes, trendFilter, treemapData]);
 
   const marketOverview = useMemo<MarketOverview | null>(() => {
-    if (!visibleTreemapData) {
+    if (!visibleTreemapData || periodDataUnavailable || visibleTreemapData.period !== period) {
       return null;
     }
 
@@ -5777,7 +5801,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
       turnoverPreviousAmount: visibleTreemapData.summary.turnoverPreviousAmount,
       turnoverDelta: visibleTreemapData.summary.turnoverDelta,
     };
-  }, [visibleTreemapData]);
+  }, [periodDataUnavailable, period, visibleTreemapData]);
 
   const sizedTreemapData = useMemo(
     () => (visibleTreemapData ? applySizeModeToTreemapData(visibleTreemapData, settledQuotes, sizeMode) : null),
@@ -7595,13 +7619,17 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
   const lastUpdatedText =
     // A freshly-loaded archival snapshot has a fixed old timestamp; label it clearly so
     // the clock never misreads as stale data once live quotes have streamed in.
-    dataSource === "fallback"
-      ? messages.sampleDataLabel
-      : updatedAt
-        ? new Date(updatedAt).toLocaleTimeString()
-        : "--:--:--";
+    periodDataUnavailable || (period !== "day" && treemapData?.period !== period)
+      ? "--:--:--"
+      : dataSource === "fallback"
+        ? messages.sampleDataLabel
+        : updatedAt
+          ? new Date(updatedAt).toLocaleTimeString()
+          : "--:--:--";
   const watchlistChangePct =
-    isWatchlist && treemapData && treemapData.stockCount > 0 ? treemapData.summary.indexChangePct : undefined;
+    !periodDataUnavailable && isWatchlist && treemapData?.period === period && treemapData.stockCount > 0
+      ? treemapData.summary.indexChangePct
+      : undefined;
 
   return (
     <div
@@ -7700,7 +7728,7 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
               </div>
               <div className={cn("space-y-1", isEnglish && "space-y-0.5")}>
                 {marketOptions.map((option) => {
-                  const summary = marketSummaries[option];
+                  const summary = periodDataUnavailable ? undefined : marketSummaries[option];
                   const isActive = market === option;
 
                   return (
@@ -8367,15 +8395,25 @@ export function MarketHeatmap({ locale: initialLocale }: { locale: Locale; messa
               <div
                 className={cn(
                   "absolute inset-x-3 top-3 z-40 flex items-center justify-between gap-3 border px-3 py-2.5 text-sm shadow-lg backdrop-blur-md sm:left-4 sm:right-4 sm:top-4",
+                  periodDataUnavailable &&
+                    "inset-0 flex-col justify-center border-0 bg-background/95 text-center sm:inset-0",
                   isLightMode
                     ? "border-amber-200 bg-white/94 text-slate-800"
-                    : "border-amber-400/30 bg-[#17130d]/92 text-slate-100"
+                    : "border-amber-400/30 bg-[#17130d]/92 text-slate-100",
+                  periodDataUnavailable &&
+                    (isLightMode ? "bg-white/95" : "bg-[#151a21]/95")
                 )}
                 role="alert"
               >
                 <div className="min-w-0">
-                  <p className="font-medium text-amber-700 dark:text-amber-300">{error}</p>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">{messages.refreshDataHint}</p>
+                  <p className="font-medium text-amber-700 dark:text-amber-300">
+                    {periodDataUnavailable ? messages.periodDataUnavailable : error}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    {periodDataUnavailable
+                      ? messages.periodDataUnavailableHint
+                      : messages.refreshDataHint}
+                  </p>
                 </div>
                 <Button
                   variant="outline"

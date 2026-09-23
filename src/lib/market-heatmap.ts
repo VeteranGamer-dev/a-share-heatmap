@@ -25,6 +25,14 @@ export const heatmapPeriodKeys = ["day", "week", "month", "year"] as const;
 export type HeatmapPeriodKey = (typeof heatmapPeriodKeys)[number];
 
 export type MarketDataSource = "direct" | "fallback" | "stale";
+export const periodDataUnavailableCode = "PERIOD_DATA_UNAVAILABLE";
+
+export class PeriodDataUnavailableError extends Error {
+  constructor() {
+    super(periodDataUnavailableCode);
+  }
+}
+
 type ExchangeCode = "SH" | "SZ" | "BJ";
 
 type RemoteQuoteValue = {
@@ -108,7 +116,7 @@ export type HeatmapStockNode = {
   value: number;
   exchange: ExchangeCode;
   price: number;
-  changePct: number;
+  changePct: number | null;
   turnoverAmount: number;
 };
 
@@ -133,7 +141,7 @@ export type TreemapResponse = {
     turnoverAmount: number;
     turnoverPreviousAmount: number;
     turnoverDelta: number;
-    indexChangePct?: number;
+    indexChangePct?: number | null;
   };
   nodes: HeatmapBoardNode[];
   source: MarketDataSource;
@@ -266,7 +274,6 @@ const eastmoneyQuoteFields = [
   "f18",
   "f20", // total market cap
   "f21", // float market cap
-  "f24", // 60-day change, used only as a defensive fallback for month
   "f25", // year-to-date change
   "f100", // Eastmoney secondary industry
   "f109", // 5-trading-day change
@@ -377,6 +384,9 @@ function toFiniteNumber(value: number | string | undefined) {
   }
 
   if (typeof value === "string") {
+    if (!value.trim()) {
+      return null;
+    }
     const parsed = Number(value);
     if (Number.isFinite(parsed)) {
       return parsed;
@@ -396,8 +406,7 @@ function getChangeForPeriod(
     return selected;
   }
 
-  const day = changes?.day;
-  return typeof day === "number" && Number.isFinite(day) ? day : fallback;
+  return period === "day" ? fallback : null;
 }
 
 export function periodFromMetricKey(metric: MetricKey): HeatmapPeriodKey {
@@ -786,18 +795,18 @@ function parseEastmoneyQuoteBatch(payload: unknown) {
 
     const dayChangePct =
       toFiniteNumber(row.f3) ?? (previousClose > 0 ? ((price - previousClose) / previousClose) * 100 : 0);
-    const weekChangePct = toFiniteNumber(row.f109) ?? dayChangePct;
-    const monthChangePct = toFiniteNumber(row.f110) ?? toFiniteNumber(row.f24) ?? dayChangePct;
-    const yearChangePct = toFiniteNumber(row.f25) ?? dayChangePct;
+    const weekChangePct = toFiniteNumber(row.f109);
+    const monthChangePct = toFiniteNumber(row.f110);
+    const yearChangePct = toFiniteNumber(row.f25);
     const turnoverAmount = toFiniteNumber(row.f6) ?? 0;
 
     quotes[code] = {
       price,
       changes: {
         day: dayChangePct,
-        week: weekChangePct,
-        month: monthChangePct,
-        year: yearChangePct,
+        ...(weekChangePct !== null && { week: weekChangePct }),
+        ...(monthChangePct !== null && { month: monthChangePct }),
+        ...(yearChangePct !== null && { year: yearChangePct }),
       },
       turnoverAmount,
     };
@@ -1044,6 +1053,9 @@ function parseEastmoneyIndexBatch(payload: unknown) {
     const name = String(row.f14 ?? "").trim();
     const price = toFiniteNumber(row.f2) ?? 0;
     const dayChangePct = toFiniteNumber(row.f3);
+    const weekChangePct = toFiniteNumber(row.f109);
+    const monthChangePct = toFiniteNumber(row.f110);
+    const yearChangePct = toFiniteNumber(row.f25);
 
     if (!name || price <= 0 || dayChangePct === null) {
       continue;
@@ -1054,9 +1066,9 @@ function parseEastmoneyIndexBatch(payload: unknown) {
       price,
       changes: {
         day: dayChangePct,
-        week: toFiniteNumber(row.f109) ?? dayChangePct,
-        month: toFiniteNumber(row.f110) ?? toFiniteNumber(row.f24) ?? dayChangePct,
-        year: toFiniteNumber(row.f25) ?? dayChangePct,
+        ...(weekChangePct !== null && { week: weekChangePct }),
+        ...(monthChangePct !== null && { month: monthChangePct }),
+        ...(yearChangePct !== null && { year: yearChangePct }),
       },
     };
   }
@@ -1497,6 +1509,25 @@ function quoteValueForPeriod(quote: RemoteQuoteValue, period: HeatmapPeriodKey):
   };
 }
 
+function requirePeriodDataCoverage(
+  stocks: StockSnapshot[],
+  quotes: Record<string, RemoteQuoteValue>,
+  period: HeatmapPeriodKey
+) {
+  if (period === "day" || stocks.length === 0) {
+    return;
+  }
+
+  const available = stocks.filter((stock) => {
+    const quote = quotes[stock.code];
+    return quote && quoteValueForPeriod(quote, period);
+  });
+  // A partial Eastmoney response must not make a mostly empty map look complete.
+  if (available.length < stocks.length * 0.9) {
+    throw new PeriodDataUnavailableError();
+  }
+}
+
 export async function streamQuoteData(options: {
   market: MarketKey;
   period: HeatmapPeriodKey;
@@ -1558,7 +1589,16 @@ export async function streamQuoteData(options: {
       emitBatch(quoteProgressState);
     }
 
-    const snapshot = await getQuoteSnapshot();
+    let snapshot: QuoteSnapshot;
+    try {
+      snapshot = await getQuoteSnapshot();
+    } catch (error) {
+      if (options.period !== "day") {
+        throw new PeriodDataUnavailableError();
+      }
+      throw error;
+    }
+    requirePeriodDataCoverage(orderedStocks, snapshot.quotes, options.period);
     const finalEntries = orderedStocks
       .map((stock) => [stock.code, snapshot.quotes[stock.code]] as const)
       .filter((entry): entry is readonly [string, RemoteQuoteValue] => Boolean(entry[1]));
@@ -1717,11 +1757,11 @@ function summarizeStocks(
     const quote = liveQuotes[stock.code];
     const changePct = getChangeForPeriod(quote?.changes, period, stock.changePct);
 
-    if (changePct > flatThreshold) {
+    if (changePct !== null && changePct > flatThreshold) {
       advanceCount += 1;
-    } else if (changePct < -flatThreshold) {
+    } else if (changePct !== null && changePct < -flatThreshold) {
       declineCount += 1;
-    } else {
+    } else if (changePct !== null) {
       flatCount += 1;
     }
 
@@ -1750,6 +1790,9 @@ function weightedChangePct(
     const value = getStockValue(stock);
     const quote = liveQuotes[stock.code];
     const changePct = getChangeForPeriod(quote?.changes, period, stock.changePct);
+    if (changePct === null) {
+      continue;
+    }
     weightedSum += changePct * value;
     totalValue += value;
   }
@@ -2073,7 +2116,7 @@ export async function getTreemapData(
   // cold visit shows a real heatmap instead of a waiting screen. Stale snapshots are
   // intentionally not cached, so hot (warm-module / shared-cache) visits go straight
   // to live data.
-  if (!quoteCache && !quotePromise) {
+  if (period === "day" && !quoteCache && !quotePromise) {
     // Kick the live fetch off in the background so it's cached by the time the first
     // poll lands; the next call then serves real data instead of this snapshot.
     void getQuoteSnapshot().catch(() => {});
@@ -2090,6 +2133,9 @@ export async function getTreemapData(
   const remoteIndexChangePct = getChangeForPeriod(remoteIndexSummary?.changes, period, Number.NaN);
 
   if (quoteResult.status !== "fulfilled") {
+    if (period !== "day") {
+      throw new PeriodDataUnavailableError();
+    }
     if (!hasLoggedFallbackWarning) {
       console.warn("Falling back to bundled market heatmap snapshot:", {
         quotes: quoteResult.reason,
@@ -2097,13 +2143,14 @@ export async function getTreemapData(
       hasLoggedFallbackWarning = true;
     }
 
-    return getFallbackTreemapData(market, period, remoteIndexChangePct);
+    return getFallbackTreemapData(market, period, remoteIndexChangePct ?? undefined);
   }
 
   hasLoggedFallbackWarning = false;
 
   const quoteStocks = getStocksForQuoteSnapshot(quoteResult.value);
   const marketStocks = await filterStocks(quoteStocks, market);
+  requirePeriodDataCoverage(marketStocks, quoteResult.value.quotes, period);
   const nodes = buildNodesFromStocks(marketStocks, quoteResult.value.quotes, period);
   const computedSummary = summarizeStocks(marketStocks, quoteResult.value.quotes, period);
   const computedIndexChangePct = weightedChangePct(marketStocks, quoteResult.value.quotes, period);
@@ -2131,7 +2178,9 @@ export async function getTreemapData(
       turnoverPreviousAmount:
         market === "all" && remoteSummary ? remoteSummary.turnoverPreviousAmount : computedSummary.turnoverPreviousAmount,
       turnoverDelta: market === "all" && remoteSummary ? remoteSummary.turnoverDelta : computedSummary.turnoverDelta,
-      indexChangePct: Number.isFinite(remoteIndexChangePct) ? remoteIndexChangePct : computedIndexChangePct,
+      indexChangePct: remoteIndexChangePct !== null && Number.isFinite(remoteIndexChangePct)
+        ? remoteIndexChangePct
+        : computedIndexChangePct,
     },
     nodes,
     source: quoteResult.value.source === "direct" ? "direct" : "stale",
@@ -2148,7 +2197,7 @@ export async function getQuoteData(
   // browser fetch that started on the same request) instead of a waiting screen.
   // Stale snapshots are never cached, so warm (warm-module / shared-cache) visits
   // go straight to live data.
-  if (!quoteCache && !quotePromise) {
+  if (period === "day" && !quoteCache && !quotePromise) {
     // Kick the live fetch off in the background so the next poll serves real data.
     void getQuoteSnapshot().catch(() => {});
     return getFallbackQuoteData(market, period, metric);
@@ -2157,6 +2206,9 @@ export async function getQuoteData(
   const quoteResult = await Promise.allSettled([getQuoteSnapshot()]);
 
   if (quoteResult[0].status !== "fulfilled") {
+    if (period !== "day") {
+      throw new PeriodDataUnavailableError();
+    }
     if (!hasLoggedFallbackWarning) {
       console.warn("Falling back to bundled market heatmap quotes:", {
         quotes: quoteResult[0].reason,
@@ -2171,13 +2223,18 @@ export async function getQuoteData(
 
   const quoteStocks = getStocksForQuoteSnapshot(quoteResult[0].value);
   const marketStocks = await filterStocks(quoteStocks, market);
+  requirePeriodDataCoverage(marketStocks, quoteResult[0].value.quotes, period);
   const quotes: Record<string, QuoteValue> = {};
 
   for (const stock of marketStocks) {
     const quote = quoteResult[0].value.quotes[stock.code];
+    const changePct = getChangeForPeriod(quote?.changes, period, stock.changePct);
+    if (changePct === null) {
+      continue;
+    }
     quotes[stock.code] = {
       price: quote?.price ?? stock.price,
-      changePct: getChangeForPeriod(quote?.changes, period, stock.changePct),
+      changePct,
       turnoverAmount: quote?.turnoverAmount ?? getStockTurnoverAmount(stock),
     };
   }
@@ -2200,6 +2257,9 @@ export async function getTreemapDataByCodes(
   const quoteResult = await Promise.allSettled([getQuoteSnapshot()]);
 
   if (quoteResult[0].status !== "fulfilled") {
+    if (period !== "day") {
+      throw new PeriodDataUnavailableError();
+    }
     if (!hasLoggedFallbackWarning) {
       console.warn("Falling back to bundled watchlist heatmap snapshot:", {
         quotes: quoteResult[0].reason,
@@ -2213,6 +2273,7 @@ export async function getTreemapDataByCodes(
   hasLoggedFallbackWarning = false;
 
   const stocks = resolveStocksByCodes(rawCodes, getStocksForQuoteSnapshot(quoteResult[0].value));
+  requirePeriodDataCoverage(stocks, quoteResult[0].value.quotes, period);
   const liveQuotes = quoteResult[0].value.quotes;
   const nodes = buildNodesFromStocks(stocks, liveQuotes, period);
   const computedSummary = summarizeStocks(stocks, liveQuotes, period);
@@ -2241,6 +2302,9 @@ export async function getQuoteDataByCodes(
   const quoteResult = await Promise.allSettled([getQuoteSnapshot()]);
 
   if (quoteResult[0].status !== "fulfilled") {
+    if (period !== "day") {
+      throw new PeriodDataUnavailableError();
+    }
     if (!hasLoggedFallbackWarning) {
       console.warn("Falling back to bundled watchlist heatmap quotes:", {
         quotes: quoteResult[0].reason,
@@ -2254,13 +2318,18 @@ export async function getQuoteDataByCodes(
   hasLoggedFallbackWarning = false;
 
   const stocks = resolveStocksByCodes(rawCodes, getStocksForQuoteSnapshot(quoteResult[0].value));
+  requirePeriodDataCoverage(stocks, quoteResult[0].value.quotes, period);
   const quotes: Record<string, QuoteValue> = {};
 
   for (const stock of stocks) {
     const quote = quoteResult[0].value.quotes[stock.code];
+    const changePct = getChangeForPeriod(quote?.changes, period, stock.changePct);
+    if (changePct === null) {
+      continue;
+    }
     quotes[stock.code] = {
       price: quote?.price ?? stock.price,
-      changePct: getChangeForPeriod(quote?.changes, period, stock.changePct),
+      changePct,
       turnoverAmount: quote?.turnoverAmount ?? getStockTurnoverAmount(stock),
     };
   }
@@ -2279,7 +2348,7 @@ export async function getOverviewData(
   period: HeatmapPeriodKey = "day"
 ): Promise<MarketOverviewResponse> {
   // First paint paints instantly on a bundled snapshot (see getTreemapData).
-  if (!quoteCache && !quotePromise) {
+  if (period === "day" && !quoteCache && !quotePromise) {
     // Kick the live fetch off in the background so the next poll serves real data.
     void getQuoteSnapshot().catch(() => {});
     const fallbackMarkets: MarketOverviewItem[] = await Promise.all(
@@ -2309,6 +2378,9 @@ export async function getOverviewData(
   ]);
 
   if (quoteResult.status !== "fulfilled") {
+    if (period !== "day") {
+      throw new PeriodDataUnavailableError();
+    }
     if (!hasLoggedFallbackWarning) {
       console.warn("Falling back to bundled market heatmap overview:", {
         quotes: quoteResult.reason,
@@ -2346,9 +2418,10 @@ export async function getOverviewData(
   const markets: MarketOverviewItem[] = await Promise.all(
     marketKeys.map(async (market) => {
       const stocks = await filterStocks(quoteStocks, market);
+      requirePeriodDataCoverage(stocks, liveQuotes, period);
       const remoteIndex = indexSummaries?.[market];
       const remoteIndexChange = getChangeForPeriod(remoteIndex?.changes, period, Number.NaN);
-      const changePct = Number.isFinite(remoteIndexChange)
+      const changePct = remoteIndexChange !== null && Number.isFinite(remoteIndexChange)
         ? remoteIndexChange
         : weightedChangePct(stocks, liveQuotes, period);
 
