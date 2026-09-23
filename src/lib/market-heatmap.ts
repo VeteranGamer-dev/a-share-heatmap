@@ -197,7 +197,8 @@ export type MarketOverviewResponse = {
 };
 
 const sinaQuoteBaseUrl = "https://hq.sinajs.cn/list=";
-// 多周期涨跌优先走 clist；ulist 作为同字段备份。push2 主站常空响应，优先 push2delay。
+const tencentQuoteBaseUrl = "https://qt.gtimg.cn/q=";
+// 东财备用源优先走 clist，ulist 作为同字段备份。push2 主站常空响应，优先 push2delay。
 const eastmoneyClistHosts = [
   "push2delay.eastmoney.com",
   "82.push2.eastmoney.com",
@@ -242,6 +243,12 @@ const sinaRequestHeaders = {
   Accept: "*/*",
 };
 
+const tencentRequestHeaders = {
+  Referer: "https://gu.qq.com/",
+  "User-Agent": "Mozilla/5.0 (compatible; AShareHeatmap/1.0)",
+  Accept: "*/*",
+};
+
 const eastmoneyRequestHeaders = {
   Referer: "https://quote.eastmoney.com/",
   "User-Agent": "Mozilla/5.0 (compatible; AShareHeatmap/1.0)",
@@ -257,6 +264,8 @@ const summaryRequestHeaders = {
 const quoteCacheMs = 8_000;
 const summaryCacheMs = 8_000;
 const sinaBatchSize = 220;
+const tencentBatchSize = 300;
+const tencentConcurrency = 4;
 const eastmoneyClistPageSize = 100;
 const eastmoneyClistConcurrency = 4;
 const eastmoneyClistMaxAttempts = 4;
@@ -726,6 +735,68 @@ function parseSinaQuoteBatch(rawText: string) {
   };
 }
 
+function parseTencentQuoteBatch(rawText: string) {
+  const quotes: Record<string, RemoteQuoteValue> = {};
+  const names: Record<string, string> = {};
+  let updatedAt = "";
+  const pattern = /v_((?:sh|sz|bj)\d{6})="([^"]*)";/g;
+
+  for (const match of rawText.matchAll(pattern)) {
+    const code = parseSinaCode(match[1]);
+    if (!code) {
+      continue;
+    }
+
+    const fields = match[2].split("~");
+    if (fields.length <= 70) {
+      continue;
+    }
+
+    const price = toFiniteNumber(fields[3]);
+    if (price === null || price <= 0) {
+      continue;
+    }
+
+    const previousClose = toFiniteNumber(fields[4]);
+    const dayChange = toFiniteNumber(fields[32]) ??
+      (previousClose !== null && previousClose > 0 ? ((price - previousClose) / previousClose) * 100 : null);
+    // Tencent quote fields: 62 = year-to-date, 63 = 5 trading days, 70 = 20 trading days.
+    const weekChange = toFiniteNumber(fields[63]);
+    const monthChange = toFiniteNumber(fields[70]);
+    const yearChange = toFiniteNumber(fields[62]);
+    const turnoverWan = toFiniteNumber(fields[57]) ?? toFiniteNumber(fields[37]);
+    const timestamp = fields[30];
+
+    quotes[code] = {
+      price,
+      changes: {
+        ...(dayChange !== null && { day: dayChange }),
+        ...(weekChange !== null && { week: weekChange }),
+        ...(monthChange !== null && { month: monthChange }),
+        ...(yearChange !== null && { year: yearChange }),
+      },
+      turnoverAmount: turnoverWan !== null ? turnoverWan * 10_000 : 0,
+    };
+    names[code] = fields[1]?.trim() || code;
+
+    if (/^\d{14}$/.test(timestamp)) {
+      const parsedTimestamp = parseShanghaiTimestamp(
+        `${timestamp.slice(0, 4)}-${timestamp.slice(4, 6)}-${timestamp.slice(6, 8)} ` +
+        `${timestamp.slice(8, 10)}:${timestamp.slice(10, 12)}:${timestamp.slice(12, 14)}`
+      );
+      if (!updatedAt || parsedTimestamp > updatedAt) {
+        updatedAt = parsedTimestamp;
+      }
+    }
+  }
+
+  return {
+    updatedAt: updatedAt || new Date().toISOString(),
+    quotes,
+    names,
+  };
+}
+
 function parseEastmoneyStockRow(row: Record<string, number | string | undefined>): StockSnapshot | null {
   const code = parseEastmoneyCode(row.f12, row.f13);
   if (!code) {
@@ -992,6 +1063,22 @@ async function fetchSinaQuoteBatch(symbols: string[]) {
   return parseSinaQuoteBatch(rawText);
 }
 
+async function fetchTencentQuoteBatch(symbols: string[]) {
+  const response = await fetch(`${tencentQuoteBaseUrl}${symbols.join(",")}`, {
+    headers: tencentRequestHeaders,
+    next: { revalidate: 0 },
+    cache: "no-store",
+    signal: AbortSignal.timeout(12_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Tencent quote request failed: ${response.status}`);
+  }
+
+  const rawText = new TextDecoder("gbk").decode(await response.arrayBuffer());
+  return parseTencentQuoteBatch(rawText);
+}
+
 function parseSinaIndexBatch(rawText: string) {
   const symbolToMarket = new Map(
     Object.entries(marketIndexSymbols).map(([market, symbol]) => [symbol, market as MarketKey])
@@ -1149,11 +1236,53 @@ async function fetchSinaMarketIndexSnapshotFromRemote(): Promise<MarketIndexSnap
   };
 }
 
+async function fetchTencentMarketIndexSnapshotFromRemote(): Promise<MarketIndexSnapshot> {
+  const symbols = Object.values(marketIndexSymbols).filter(
+    (symbol): symbol is string => Boolean(symbol && /^(?:sh|sz)\d{6}$/.test(symbol))
+  );
+  const result = await fetchTencentQuoteBatch(symbols);
+  const summaries: Partial<Record<MarketKey, MarketIndexValue>> = {};
+
+  for (const [market, symbol] of Object.entries(marketIndexSymbols)) {
+    if (!symbol) {
+      continue;
+    }
+    const code = parseSinaCode(symbol);
+    if (!code) {
+      continue;
+    }
+    const quote = result.quotes[code];
+    if (quote?.changes.day === undefined) {
+      continue;
+    }
+    summaries[market as MarketKey] = {
+      name: result.names[code] ?? market,
+      price: quote.price,
+      changes: quote.changes,
+    };
+  }
+
+  if (Object.keys(summaries).length < marketIndexCount * 0.75) {
+    throw new Error("Tencent index snapshot is incomplete");
+  }
+
+  return {
+    timestamp: Date.now(),
+    updatedAt: result.updatedAt,
+    summaries,
+    source: "direct",
+  };
+}
+
 async function fetchMarketIndexSnapshotFromRemote(): Promise<MarketIndexSnapshot> {
   try {
-    return await fetchEastmoneyMarketIndexSnapshotFromRemote();
+    return await fetchTencentMarketIndexSnapshotFromRemote();
   } catch {
-    return fetchSinaMarketIndexSnapshotFromRemote();
+    try {
+      return await fetchEastmoneyMarketIndexSnapshotFromRemote();
+    } catch {
+      return fetchSinaMarketIndexSnapshotFromRemote();
+    }
   }
 }
 
@@ -1256,6 +1385,47 @@ async function fetchEastmoneyQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
   }
 }
 
+async function fetchTencentQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
+  const symbols = baselineStocks.map((stock) => toSinaSymbol(stock.code));
+  const batches: string[][] = [];
+  for (let index = 0; index < symbols.length; index += tencentBatchSize) {
+    batches.push(symbols.slice(index, index + tencentBatchSize));
+  }
+
+  const results = await mapWithConcurrency(batches, tencentConcurrency, async (batch) => {
+    try {
+      const result = await fetchTencentQuoteBatch(batch);
+      publishQuoteProgress(result);
+      return result;
+    } catch {
+      return null;
+    }
+  });
+
+  const quotes: Record<string, RemoteQuoteValue> = {};
+  let updatedAt = "";
+  for (const result of results) {
+    if (!result) {
+      continue;
+    }
+    Object.assign(quotes, result.quotes);
+    if (result.updatedAt > updatedAt) {
+      updatedAt = result.updatedAt;
+    }
+  }
+
+  if (countBaselineQuoteCoverage(quotes) < baselineStocks.length * 0.9) {
+    throw new Error("Tencent quote snapshot is incomplete");
+  }
+
+  return {
+    timestamp: Date.now(),
+    updatedAt: updatedAt || new Date().toISOString(),
+    quotes,
+    source: "direct",
+  };
+}
+
 async function fetchSinaQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
   const symbols = baselineStocks.map((stock) => toSinaSymbol(stock.code));
   const batches: string[][] = [];
@@ -1295,6 +1465,15 @@ async function fetchSinaQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
 
 function countBaselineQuoteCoverage(quotes: Record<string, RemoteQuoteValue>) {
   return baselineStocks.reduce((count, stock) => (quotes[stock.code] ? count + 1 : count), 0);
+}
+
+function hasBaselinePeriodCoverage(quotes: Record<string, RemoteQuoteValue>) {
+  return heatmapPeriodKeys.every((period) =>
+    baselineStocks.reduce((count, stock) => {
+      const change = quotes[stock.code]?.changes[period];
+      return typeof change === "number" && Number.isFinite(change) ? count + 1 : count;
+    }, 0) >= baselineStocks.length * 0.9
+  );
 }
 
 function mergeStockSnapshots(primary: QuoteSnapshot, secondary: QuoteSnapshot | null) {
@@ -1388,6 +1567,13 @@ function mergeQuoteSnapshots(
 }
 
 async function fetchQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
+  // Tencent's batch quote includes independently verified 5-day, 20-day and
+  // year-to-date changes. It also avoids the Eastmoney-only period dependency.
+  const tencentSnapshot = await fetchTencentQuoteSnapshotFromRemote().catch(() => null);
+  if (tencentSnapshot && hasBaselinePeriodCoverage(tencentSnapshot.quotes)) {
+    return tencentSnapshot;
+  }
+
   const sinaPromise = fetchSinaQuoteSnapshotFromRemote()
     .then((snapshot) => ({ snapshot, error: null as Error | null }))
     .catch((error: unknown) => ({
@@ -1413,22 +1599,26 @@ async function fetchQuoteSnapshotFromRemote(): Promise<QuoteSnapshot> {
   const eastmoneySnapshot = eastmoneyResult.snapshot;
   const sinaSnapshot = sinaResult.snapshot;
 
-  // Prefer Eastmoney as the primary source because it carries week/month/year changes.
+  // Merge remaining providers if Tencent was incomplete or unavailable.
   if (eastmoneySnapshot && countBaselineQuoteCoverage(eastmoneySnapshot.quotes) >= baselineStocks.length * 0.9) {
-    return mergeQuoteSnapshots(eastmoneySnapshot, sinaSnapshot);
+    return mergeQuoteSnapshots(mergeQuoteSnapshots(eastmoneySnapshot, sinaSnapshot), tencentSnapshot);
   }
 
   if (sinaSnapshot && countBaselineQuoteCoverage(sinaSnapshot.quotes) >= baselineStocks.length * 0.9) {
-    // Merge any partial Eastmoney period fields onto the reliable Sina day snapshot.
-    return mergeQuoteSnapshots(sinaSnapshot, eastmoneySnapshot);
+    // Merge any partial multi-period fields onto the reliable Sina day snapshot.
+    return mergeQuoteSnapshots(mergeQuoteSnapshots(sinaSnapshot, eastmoneySnapshot), tencentSnapshot);
   }
 
   if (eastmoneySnapshot && countBaselineQuoteCoverage(eastmoneySnapshot.quotes) > 0) {
-    return mergeQuoteSnapshots(eastmoneySnapshot, sinaSnapshot);
+    return mergeQuoteSnapshots(mergeQuoteSnapshots(eastmoneySnapshot, sinaSnapshot), tencentSnapshot);
   }
 
   if (sinaSnapshot) {
-    return sinaSnapshot;
+    return mergeQuoteSnapshots(sinaSnapshot, tencentSnapshot);
+  }
+
+  if (tencentSnapshot) {
+    return tencentSnapshot;
   }
 
   throw eastmoneyResult.error ?? sinaResult.error ?? new Error("Quote snapshot is unavailable");
