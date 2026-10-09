@@ -1,0 +1,84 @@
+name: 部署到京东云
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-jdcloud
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出最新代码
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 开启 standalone 输出（仅本次构建，不提交）
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "next.config.ts";
+            const src = fs.readFileSync(file, "utf8");
+            const marker = "const nextConfig: NextConfig = {";
+            if (!src.includes(marker)) {
+              console.error("next.config.ts 写法变了，找不到 " + marker);
+              process.exit(1);
+            }
+            fs.writeFileSync(file, src.replace(marker, marker + "\n  output: \"standalone\","));
+          '
+
+      - name: 构建
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: pnpm build
+
+      # 跨境上传很慢（约 25 KB/s），所以不带 node_modules，
+      # 只附上依赖清单，由服务器从国内镜像安装并按哈希复用
+      - name: 打包（不含 node_modules）
+        run: |
+          OUT=.next/standalone
+          cp -r public "$OUT/public"
+          mkdir -p "$OUT/.next" "$OUT/deps"
+          cp -r .next/static "$OUT/.next/static"
+          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$OUT/deps/"
+          git rev-parse --short HEAD > "$OUT/REVISION"
+          tar -czf package.tar.gz --exclude=./node_modules -C "$OUT" .
+          ls -lh package.tar.gz
+
+      - name: 推送到服务器并等待部署结果
+        env:
+          SSH_KEY: ${{ secrets.JDCLOUD_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.JDCLOUD_KNOWN_HOSTS }}
+          HOST: ${{ secrets.JDCLOUD_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 -o ConnectTimeout=30 \
+            "heatmap@$HOST" < package.tar.gz
