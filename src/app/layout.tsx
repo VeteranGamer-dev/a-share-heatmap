@@ -64,12 +64,6 @@ export default function RootLayout({
     >
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
-        <script
-          defer
-          src="https://vibeloft.ai/telemetry/v1.js"
-          data-vl-product-id="8b8a5508-0aeb-4917-83a4-c8d6f5ece702"
-          data-vl-auth-key="vl_web.YE4bgecRx9HGPM3CglWnBzMiindBvSnCiLq3EG4SPoc"
-        />
       </head>
       <body className="flex min-h-dvh flex-col">
         {children}
