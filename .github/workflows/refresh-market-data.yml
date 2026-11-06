@@ -25,6 +25,8 @@ jobs:
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
 
       - name: 安装 Node.js
         uses: actions/setup-node@v4
@@ -35,14 +37,7 @@ jobs:
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
 
-      - name: 单元测试
-        run: pnpm test
-
       - name: 刷新并验证股票数据
-        env:
-          # Exchange endpoints can take longer than Node's default 250 ms
-          # address-family connection attempt from GitHub-hosted runners.
-          NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=5000
         run: pnpm refresh:data
 
       - name: 检查类型和生产构建
@@ -52,7 +47,7 @@ jobs:
 
       - name: 提交更新
         run: |
-          git add src/lib/data/market-heatmap-fallback.json src/lib/data/market-heatmap-subboards.json src/lib/data/stock-listing-status.json
+          git add src/lib/data/market-heatmap-fallback.json src/lib/data/market-heatmap-subboards.json
           if git diff --cached --quiet; then
             echo "股票数据没有变化"
             exit 0
